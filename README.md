@@ -109,4 +109,11 @@ If you find this work helpful in your research or applications, please consider 
   booktitle={SC25: International Conference for High Performance Computing, Networking, Storage and Analysis}, 
   year={2025},
 }
+
+@INPROCEEDINGS{ringX_app,
+      author={Junqi Yin and Mijanur Palash and M. Paul Laiu and Muralikrishnan Gopalakrishnan Meena and John Gounley and Stephen M. de Bruyn Kops and Feiyi Wang and Ramanan Sankaran and Pei Zhang},
+      title={Pixel-Resolved Long-Context Learning for Turbulence at Exascale: Resolving Small-scale Eddies Toward the Viscous Limit},
+      booktitle={2026 IEEE International Parallel and Distributed Processing Symposium (IPDPS)}, 
+      year={2026},
+}
 ``` 
