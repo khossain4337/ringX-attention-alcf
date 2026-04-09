@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Optional, Tuple
 
@@ -170,6 +171,42 @@ def _flash_backward(
     return dq, dk, dv
 
 
+def _portable_tile_sizes() -> Tuple[int, int]:
+    q_tile = int(os.environ.get("RINGX_ATTN_PORTABLE_Q_TILE", "128"))
+    k_tile = int(os.environ.get("RINGX_ATTN_PORTABLE_K_TILE", "64"))
+    if q_tile <= 0 or k_tile <= 0:
+        raise ValueError("Portable tile sizes must be positive integers.")
+    return q_tile, k_tile
+
+
+
+def _apply_local_mask_(
+    scores: torch.Tensor,
+    q_start: int,
+    k_start: int,
+    causal: bool,
+    window_size: Tuple[int, int],
+) -> None:
+    invalid = None
+    q_len = scores.shape[-2]
+    k_len = scores.shape[-1]
+    if causal or window_size[0] >= 0 or window_size[1] >= 0:
+        q_pos = torch.arange(q_start, q_start + q_len, device=scores.device).unsqueeze(-1)
+        k_pos = torch.arange(k_start, k_start + k_len, device=scores.device).unsqueeze(0)
+        if causal:
+            invalid = k_pos > q_pos
+        window_left, window_right = window_size
+        if window_left >= 0:
+            left_invalid = k_pos < (q_pos - window_left)
+            invalid = left_invalid if invalid is None else (invalid | left_invalid)
+        if window_right >= 0:
+            right_invalid = k_pos > (q_pos + window_right)
+            invalid = right_invalid if invalid is None else (invalid | right_invalid)
+    if invalid is not None:
+        scores.masked_fill_(invalid.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+
+
 def _portable_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -186,23 +223,68 @@ def _portable_forward(
     if alibi_slopes is not None:
         raise NotImplementedError("The portable backend does not support alibi_slopes.")
 
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
     qh = q.permute(0, 2, 1, 3).to(torch.float32)
     kh = k.permute(0, 2, 1, 3).to(torch.float32)
     vh = v.permute(0, 2, 1, 3).to(torch.float32)
 
-    scores = torch.matmul(qh, kh.transpose(-1, -2)) * softmax_scale
-    invalid = _build_local_mask(q.shape[1], k.shape[1], causal, window_size, q.device)
-    if invalid is not None:
-        scores = scores.masked_fill(invalid.unsqueeze(0).unsqueeze(0), float("-inf"))
+    batch, nheads, seqlen_q, head_dim = qh.shape
+    seqlen_k = kh.shape[-2]
+    q_tile, k_tile = _portable_tile_sizes()
 
-    lse = torch.logsumexp(scores, dim=-1)
-    probs = torch.exp(scores - lse.unsqueeze(-1))
-    if invalid is not None and invalid.any():
-        probs = probs.masked_fill(invalid.unsqueeze(0).unsqueeze(0), 0.0)
-    probs = torch.where(torch.isfinite(lse).unsqueeze(-1), probs, torch.zeros_like(probs))
+    out = torch.empty((batch, nheads, seqlen_q, head_dim), device=q.device, dtype=torch.float32)
+    lse = torch.empty((batch, nheads, seqlen_q), device=q.device, dtype=torch.float32)
 
-    out = torch.matmul(probs, vh).permute(0, 2, 1, 3).contiguous()
+    for q_start in range(0, seqlen_q, q_tile):
+        q_end = min(q_start + q_tile, seqlen_q)
+        q_blk = qh[:, :, q_start:q_end, :]
+        q_len = q_end - q_start
+
+        m_i = torch.full((batch, nheads, q_len), float("-inf"), device=q.device, dtype=torch.float32)
+        l_i = torch.zeros((batch, nheads, q_len), device=q.device, dtype=torch.float32)
+        acc = torch.zeros((batch, nheads, q_len, head_dim), device=q.device, dtype=torch.float32)
+
+        for k_start in range(0, seqlen_k, k_tile):
+            k_end = min(k_start + k_tile, seqlen_k)
+            k_blk = kh[:, :, k_start:k_end, :]
+            v_blk = vh[:, :, k_start:k_end, :]
+
+            scores = torch.matmul(q_blk, k_blk.transpose(-1, -2)) * softmax_scale
+            _apply_local_mask_(scores, q_start, k_start, causal, window_size)
+
+            block_m = scores.amax(dim=-1)
+            new_m = torch.maximum(m_i, block_m)
+            alpha = torch.where(
+                torch.isfinite(m_i),
+                torch.exp(m_i - new_m),
+                torch.zeros_like(new_m),
+            )
+            p = torch.where(
+                torch.isfinite(scores),
+                torch.exp(scores - new_m.unsqueeze(-1)),
+                torch.zeros_like(scores),
+            )
+            l_i = l_i * alpha + p.sum(dim=-1)
+            acc = acc * alpha.unsqueeze(-1) + torch.matmul(p, v_blk)
+            m_i = new_m
+
+        valid = l_i > 0
+        out[:, :, q_start:q_end, :] = torch.where(
+            valid.unsqueeze(-1),
+            acc / l_i.unsqueeze(-1).clamp_min(1e-20),
+            torch.zeros_like(acc),
+        )
+        lse[:, :, q_start:q_end] = torch.where(
+            valid,
+            torch.log(l_i) + m_i,
+            torch.full_like(m_i, float("-inf")),
+        )
+
+    out = out.permute(0, 2, 1, 3).contiguous()
     return out.to(q.dtype), lse.contiguous()
+
 
 
 def _portable_backward(
@@ -224,6 +306,9 @@ def _portable_backward(
     if alibi_slopes is not None:
         raise NotImplementedError("The portable backend does not support alibi_slopes.")
 
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
     qh = q.permute(0, 2, 1, 3).to(torch.float32)
     kh = k.permute(0, 2, 1, 3).to(torch.float32)
     vh = v.permute(0, 2, 1, 3).to(torch.float32)
@@ -231,23 +316,44 @@ def _portable_backward(
     outh = out.permute(0, 2, 1, 3).to(torch.float32)
     lse = softmax_lse.to(torch.float32)
 
-    scores = torch.matmul(qh, kh.transpose(-1, -2)) * softmax_scale
-    invalid = _build_local_mask(q.shape[1], k.shape[1], causal, window_size, q.device)
-    if invalid is not None:
-        scores = scores.masked_fill(invalid.unsqueeze(0).unsqueeze(0), float("-inf"))
+    batch, nheads, seqlen_q, head_dim = qh.shape
+    seqlen_k = kh.shape[-2]
+    q_tile, k_tile = _portable_tile_sizes()
 
-    probs = torch.exp(scores - lse.unsqueeze(-1))
-    if invalid is not None and invalid.any():
-        probs = probs.masked_fill(invalid.unsqueeze(0).unsqueeze(0), 0.0)
-    probs = torch.where(torch.isfinite(lse).unsqueeze(-1), probs, torch.zeros_like(probs))
+    dq = torch.zeros_like(qh)
+    dk = torch.zeros_like(kh)
+    dv = torch.zeros_like(vh)
+    delta = (douth * outh).sum(dim=-1)
 
-    dp = torch.matmul(douth, vh.transpose(-1, -2))
-    correction = (douth * outh).sum(dim=-1, keepdim=True)
-    ds = probs * (dp - correction)
+    for q_start in range(0, seqlen_q, q_tile):
+        q_end = min(q_start + q_tile, seqlen_q)
+        q_blk = qh[:, :, q_start:q_end, :]
+        do_blk = douth[:, :, q_start:q_end, :]
+        lse_blk = lse[:, :, q_start:q_end]
+        delta_blk = delta[:, :, q_start:q_end]
+        dq_blk = torch.zeros_like(q_blk)
 
-    dq = torch.matmul(ds, kh) * softmax_scale
-    dk = torch.matmul(ds.transpose(-1, -2), qh) * softmax_scale
-    dv = torch.matmul(probs.transpose(-1, -2), douth)
+        for k_start in range(0, seqlen_k, k_tile):
+            k_end = min(k_start + k_tile, seqlen_k)
+            k_blk = kh[:, :, k_start:k_end, :]
+            v_blk = vh[:, :, k_start:k_end, :]
+
+            scores = torch.matmul(q_blk, k_blk.transpose(-1, -2)) * softmax_scale
+            _apply_local_mask_(scores, q_start, k_start, causal, window_size)
+
+            p = torch.where(
+                torch.isfinite(scores) & torch.isfinite(lse_blk.unsqueeze(-1)),
+                torch.exp(scores - lse_blk.unsqueeze(-1)),
+                torch.zeros_like(scores),
+            )
+            dp = torch.matmul(do_blk, v_blk.transpose(-1, -2))
+            ds = p * (dp - delta_blk.unsqueeze(-1))
+
+            dq_blk = dq_blk + torch.matmul(ds, k_blk) * softmax_scale
+            dk[:, :, k_start:k_end, :] = dk[:, :, k_start:k_end, :] + torch.matmul(ds.transpose(-1, -2), q_blk) * softmax_scale
+            dv[:, :, k_start:k_end, :] = dv[:, :, k_start:k_end, :] + torch.matmul(p.transpose(-1, -2), do_blk)
+
+        dq[:, :, q_start:q_end, :] = dq_blk
 
     dq = dq.permute(0, 2, 1, 3).contiguous().to(q.dtype)
     dk = dk.permute(0, 2, 1, 3).contiguous().to(k.dtype)
