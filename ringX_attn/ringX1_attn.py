@@ -74,8 +74,9 @@ def ringX_attn_forward(
     for i in range(world_size - 1, -1, -1):
         q_buffer[:] = q
         res_rank = dist.get_global_rank(process_group, i)
-        dist.broadcast(q_buffer, src=res_rank, group=process_group) 
-        
+        with torch.no_grad():
+            dist.broadcast(q_buffer, src=res_rank, group=process_group)
+
         if not causal or rank <= i:
             loc_out, loc_lse = flash_forward(q_buffer, k, v, causal=causal and rank == i)   
             loc_out = loc_out.to(torch.float32)
@@ -178,8 +179,9 @@ def ringX_attn_backward(
         kv_buffer[:k_size0].copy_(k)
         kv_buffer[k_size0:].copy_(v)
         res_rank = dist.get_global_rank(process_group, i)
-        dist.broadcast(kv_buffer, src=res_rank, group=process_group)
-        
+        with torch.no_grad():
+            dist.broadcast(kv_buffer, src=res_rank, group=process_group)
+
         flash_backward(dout, q, kv_buffer[:k_size0], kv_buffer[k_size0:], out, softmax_lse, causal=(causal and rank==i)) 
         if dq is None: 
             dq = dq_buffer.to(torch.float32)

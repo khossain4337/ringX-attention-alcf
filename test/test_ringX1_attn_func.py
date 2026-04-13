@@ -69,12 +69,14 @@ if __name__ == "__main__":
         dtype=dtype,
         requires_grad=True,
     )
-    dist.broadcast(q, src=0)
-    dist.broadcast(k, src=0)
-    dist.broadcast(v, src=0)
+    with torch.no_grad():
+        dist.broadcast(q, src=0)
+        dist.broadcast(k, src=0)
+        dist.broadcast(v, src=0)
 
     dout = torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=dtype)
-    dist.broadcast(dout, src=0)
+    with torch.no_grad():
+        dist.broadcast(dout, src=0)
 
     local_q = q.chunk(world_size, dim=1)[rank].detach().clone()
     local_k = k.chunk(world_size, dim=1)[rank].detach().clone()
