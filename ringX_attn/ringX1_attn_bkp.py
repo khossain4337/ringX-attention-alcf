@@ -28,48 +28,37 @@ def ringX_attn_forward(
     world_size = dist.get_world_size(group=process_group)
     out, lse, lse_max = None, None, None
     q_buffer = torch.empty_like(q).contiguous()
-
     def flash_forward(q, k, v, causal):
-        if HAS_FLASH:
-            params = get_default_args(_flash_attn_forward).copy()
-            if "window_size" in params:
-                params.update({"window_size": window_size})
-            else:
-                params.update(
-                         {
-                             "window_size_left": window_size[0],
-                             "window_size_right": window_size[1],
-                         }
-                )
-            params.update(
-                {
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "dropout_p": dropout_p,
-                    "softmax_scale": softmax_scale,
-                    "causal": causal,
-                    "alibi_slopes": alibi_slopes,
-                    "return_softmax": True and dropout_p > 0,
-                }
-            )
-            outputs = _flash_attn_forward(**params)
-            if len(outputs) == 8:
-                out, _, _, _, _, lse, _, _ = outputs
-            else:
-                assert len(outputs) == 4
-                out, lse, _, _ = outputs
-            return out, lse
+        params = get_default_args(_flash_attn_forward).copy()
+        if "window_size" in params:
+            params.update({"window_size": window_size})
         else:
-            # fused_attention_func expects (batch, heads, seqlen, head_dim)
-            # ringX uses (batch, seqlen, heads, head_dim) — transpose in and out
-            q_t = q.transpose(1, 2)
-            k_t = k.transpose(1, 2)
-            v_t = v.transpose(1, 2)
-            out_t, lse = fused_attention_func(q_t, k_t, v_t, causal, softmax_scale)
-            # transpose output back to (batch, seqlen, heads, head_dim)
-            out = out_t.transpose(1, 2)
-            return out, lse
+            params.update(
+                     {
+                         "window_size_left": window_size[0],
+                         "window_size_right": window_size[1],
+                     }
+            )
+        params.update(
+            {
+                "q": q,
+                "k": k,
+                "v": v,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": causal,
+                "alibi_slopes": alibi_slopes,
+                "return_softmax": True and dropout_p > 0,
+            }
+        )
+        outputs = _flash_attn_forward(**params)
+        if len(outputs) == 8:
+            out, _, _, _, _, lse, _, _ = outputs
+        else:
+            assert len(outputs) == 4
+            out, lse, _, _ = outputs
+
+        return out, lse
 
     for i in range(world_size - 1, -1, -1):
         q_buffer[:] = q
