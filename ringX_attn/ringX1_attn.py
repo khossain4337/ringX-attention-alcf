@@ -127,37 +127,52 @@ def ringX_attn_backward(
     dkv_sum = torch.empty_like(kv, dtype=torch.float32).contiguous()
 
     def flash_backward(dout, q, k, v, out, softmax_lse, causal):
-        params = get_default_args(_flash_attn_backward).copy()
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
+        if HAS_FLASH:
+            params = get_default_args(_flash_attn_backward).copy()
+            if "window_size" in params:
+                params.update({"window_size": window_size})
+            else:
+                params.update(
+                         {
+                             "window_size_left": window_size[0],
+                             "window_size_right": window_size[1],
+                         }
+                )
+            rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
             params.update(
-                     {
-                         "window_size_left": window_size[0],
-                         "window_size_right": window_size[1],
-                     }
+                {
+                    "dout": dout,
+                    "q": q,
+                    "k": k,
+                    "v": v,
+                    "out": out,
+                    "softmax_lse": softmax_lse,
+                    "dq": dq_buffer,
+                    "dk": dk_buffer,
+                    "dv": dv_buffer,
+                    "dropout_p": dropout_p,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal,
+                    "alibi_slopes": alibi_slopes,
+                    "deterministic": deterministic,
+                    "rng_state": rng_state,
+                }
             )
-        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-        params.update(
-            {
-                "dout": dout,
-                "q": q,
-                "k": k,
-                "v": v,
-                "out": out,
-                "softmax_lse": softmax_lse,
-                "dq": dq_buffer,
-                "dk": dk_buffer,
-                "dv": dv_buffer,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
-                "rng_state": rng_state,
-            }
-        )
-        _flash_attn_backward(**params)
+            _flash_attn_backward(**params)
+        else:
+            # Use autograd to compute gradients via fused_attention_func
+            # fused_attention_func expects (batch, heads, seqlen, head_dim)
+            with torch.enable_grad():
+                q_t = q.detach().transpose(1, 2).contiguous().requires_grad_(True)
+                k_t = k.detach().transpose(1, 2).contiguous().requires_grad_(True)
+                v_t = v.detach().transpose(1, 2).contiguous().requires_grad_(True)
+                loc_out_t, _ = fused_attention_func(q_t, k_t, v_t, causal, softmax_scale)
+                dout_t = dout.transpose(1, 2).contiguous()
+                loc_out_t.backward(dout_t)
+            # transpose gradients back to (batch, seqlen, heads, head_dim)
+            dq_buffer.copy_(q_t.grad.transpose(1, 2))
+            dk_buffer.copy_(k_t.grad.transpose(1, 2))
+            dv_buffer.copy_(v_t.grad.transpose(1, 2))
 
     for i in range(world_size):
         kv_buffer[:k_size0].copy_(k)
