@@ -1,0 +1,56 @@
+fused-attention-batch4-head32-d64-fwd-causal=True-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0      56.060526      8.158900
+1   2048.0      59.776489      9.710378
+2   4096.0      64.675601     10.792528
+3   8192.0      79.253971     11.770974
+4  16384.0      81.651673     12.350136
+fused-attention-batch4-head32-d64-fwd-causal=False-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0      54.793649     10.192113
+1   2048.0      57.037059     10.878666
+2   4096.0      60.988945     13.738991
+3   8192.0      65.635798     14.193173
+4  16384.0      66.176759     14.314410
+fused-attention-batch4-head32-d64-bwd-causal=True-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0       3.081586      3.078613
+1   2048.0       3.579727      3.559523
+2   4096.0       3.935915      3.926081
+3   8192.0       4.135833      4.152418
+4  16384.0       4.180817      4.180539
+fused-attention-batch4-head32-d64-bwd-causal=False-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0       3.840179      3.839389
+1   2048.0       4.157053      4.161314
+2   4096.0       4.245660      4.251558
+3   8192.0       4.379949      4.380760
+4  16384.0       4.423273      4.425572
+fused-attention-batch4-head32-d128-fwd-causal=True-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0      46.764668      2.925949
+1   2048.0      49.696753      3.409736
+2   4096.0      54.231382      3.708318
+3   8192.0      56.799000      3.865508
+4  16384.0      57.098148      3.981210
+fused-attention-batch4-head32-d128-fwd-causal=False-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0      48.975795      3.585507
+1   2048.0      56.009313      3.814062
+2   4096.0      52.452311      4.017857
+3   8192.0      54.143397      3.934113
+4  16384.0      54.934134      3.979634
+fused-attention-batch4-head32-d128-bwd-causal=True-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0       1.400962      1.400423
+1   2048.0       1.581072      1.582333
+2   4096.0       1.704981      1.693046
+3   8192.0       1.770630      1.773350
+4  16384.0       1.812183      1.811830
+fused-attention-batch4-head32-d128-bwd-causal=False-warp_specialize=False:
+     N_CTX  Triton [FP16]  Triton [FP8]
+0   1024.0       1.875671      1.875517
+1   2048.0       1.971679      1.971462
+2   4096.0       1.997730      1.997916
+3   8192.0       2.025220      2.025225
+4  16384.0       2.037946      2.037946
