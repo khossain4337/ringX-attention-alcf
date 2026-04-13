@@ -1,6 +1,14 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+#from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+## edit
+try:
+    from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+    HAS_FLASH = True
+except ImportError:
+    HAS_FLASH = False
+    from .fused_attention import attention as fused_attention_func
+##
 from .utils import get_default_args
 
 def ringX_attn_forward(

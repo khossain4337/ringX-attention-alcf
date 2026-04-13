@@ -11,3 +11,6 @@ o, M = attention(q, k, v, False, 0.125)
 print(f"o.shape: {o.shape}")  # expect (1, 4, 1024, 128)
 print(f"M.shape: {M.shape}")  # expect (1, 4, 1024)
 print("OK!")
+
+from ringX_attn.ringX1_attn import ringX1_attn_func
+print("import OK!")
