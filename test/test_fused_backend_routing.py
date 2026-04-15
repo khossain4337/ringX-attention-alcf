@@ -45,6 +45,98 @@ def _barrier():
         dist.barrier()
 
 
+def test_forward_dispatch_uses_backend_adapter_table():
+    q, k, v = _sample_tensors()
+    captured = {}
+    adapter_out = torch.full_like(q, 29.0)
+    adapter_lse = torch.full((q.shape[0], q.shape[2], q.shape[1]), 31.0)
+
+    def _forward(call):
+        captured["call_type"] = type(call).__name__
+        captured["shapes"] = (call.q.shape, call.k.shape, call.v.shape)
+        captured["window_size"] = call.window_size
+        captured["deterministic"] = call.deterministic
+        return adapter_out, adapter_lse
+
+    adapters = dict(backend._BACKEND_ADAPTERS)
+    adapters["portable"] = backend._BackendAdapter(
+        name="portable",
+        available=lambda: True,
+        unavailable_error=None,
+        forward=_forward,
+        backward=lambda call: (_ for _ in ()).throw(AssertionError("backward should not be called")),
+    )
+
+    with patched_attrs(backend, _BACKEND_ADAPTERS=adapters):
+        out, lse = backend.local_attn_forward(
+            q,
+            k,
+            v,
+            softmax_scale=None,
+            window_size=(7, 9),
+            deterministic=True,
+            backend="portable",
+        )
+
+    assert out is adapter_out
+    assert lse is adapter_lse
+    assert captured["call_type"] == "_ForwardCall"
+    assert captured["shapes"] == (q.shape, k.shape, v.shape)
+    assert captured["window_size"] == (7, 9)
+    assert captured["deterministic"] is True
+
+
+
+def test_backward_dispatch_uses_backend_adapter_table():
+    q, k, v = _sample_tensors()
+    dout = torch.randn_like(q)
+    out = torch.randn_like(q)
+    lse = torch.randn(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32)
+    captured = {}
+    grads = tuple(torch.full_like(tensor, fill_value) for tensor, fill_value in ((q, 37.0), (k, 41.0), (v, 43.0)))
+
+    def _backward(call):
+        captured["call_type"] = type(call).__name__
+        captured["dout_shape"] = call.dout.shape
+        captured["out_shape"] = call.out.shape
+        captured["lse_shape"] = call.softmax_lse.shape
+        captured["causal"] = call.causal
+        captured["softmax_scale"] = call.softmax_scale
+        return grads
+
+    adapters = dict(backend._BACKEND_ADAPTERS)
+    adapters["portable"] = backend._BackendAdapter(
+        name="portable",
+        available=lambda: True,
+        unavailable_error=None,
+        forward=lambda call: (_ for _ in ()).throw(AssertionError("forward should not be called")),
+        backward=_backward,
+    )
+
+    with patched_attrs(backend, _BACKEND_ADAPTERS=adapters):
+        dq, dk, dv = backend.local_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            softmax_scale=0.25,
+            causal=True,
+            backend="portable",
+        )
+
+    assert dq is grads[0]
+    assert dk is grads[1]
+    assert dv is grads[2]
+    assert captured["call_type"] == "_BackwardCall"
+    assert captured["dout_shape"] == dout.shape
+    assert captured["out_shape"] == out.shape
+    assert captured["lse_shape"] == lse.shape
+    assert captured["causal"] is True
+    assert captured["softmax_scale"] == 0.25
+
+
 def test_auto_uses_fused_when_available_and_supported():
     q, k, v = _sample_tensors()
     fused_out = torch.full_like(q, 7.0)
@@ -280,6 +372,14 @@ def test_explicit_fused_backward_raises_for_unsupported_call():
 if __name__ == "__main__":
     initialized = _init_dist_if_needed()
     rank = _rank()
+
+    test_forward_dispatch_uses_backend_adapter_table()
+    if rank == 0:
+        print("[ok] forward dispatch uses the backend adapter table", flush=True)
+
+    test_backward_dispatch_uses_backend_adapter_table()
+    if rank == 0:
+        print("[ok] backward dispatch uses the backend adapter table", flush=True)
 
     test_auto_uses_fused_when_available_and_supported()
     if rank == 0:
