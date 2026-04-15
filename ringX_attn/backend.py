@@ -227,6 +227,156 @@ def available_backends():
     )
 
 
+
+def forward_support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    backend: Optional[str] = None,
+    softmax_scale: Optional[float] = None,
+    dropout_p: float = 0.0,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+) -> Optional[str]:
+    selected = _requested_backend_name(backend)
+    if selected not in _VALID_BACKENDS:
+        raise ValueError(f"Unsupported backend '{selected}'. Expected one of {_VALID_BACKENDS}.")
+    if selected == "auto":
+        return None
+
+    adapter = _BACKEND_ADAPTERS[selected]
+    if not adapter.available():
+        return adapter.unavailable_error() if adapter.unavailable_error is not None else "backend is not available."
+
+    if adapter.forward_support_error is None:
+        return None
+
+    call = _ForwardCall(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+    )
+    return adapter.forward_support_error(call)
+
+
+
+def backward_support_error(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    *,
+    backend: Optional[str] = None,
+    softmax_scale: Optional[float] = None,
+    dropout_p: float = 0.0,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+) -> Optional[str]:
+    selected = _requested_backend_name(backend)
+    if selected not in _VALID_BACKENDS:
+        raise ValueError(f"Unsupported backend '{selected}'. Expected one of {_VALID_BACKENDS}.")
+    if selected == "auto":
+        return None
+
+    adapter = _BACKEND_ADAPTERS[selected]
+    if not adapter.available():
+        return adapter.unavailable_error() if adapter.unavailable_error is not None else "backend is not available."
+
+    if adapter.backward_support_error is None:
+        return None
+
+    call = _BackwardCall(
+        dout=dout,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        softmax_lse=softmax_lse,
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+    )
+    return adapter.backward_support_error(call)
+
+
+
+def runtime_forward_backend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    backend: Optional[str] = None,
+    softmax_scale: Optional[float] = None,
+    dropout_p: float = 0.0,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+) -> str:
+    call = _ForwardCall(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+    )
+    return _forward_runtime_adapter(backend, call).name
+
+
+
+def runtime_backward_backend(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    *,
+    backend: Optional[str] = None,
+    softmax_scale: Optional[float] = None,
+    dropout_p: float = 0.0,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+) -> str:
+    call = _BackwardCall(
+        dout=dout,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        softmax_lse=softmax_lse,
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+    )
+    return _backward_runtime_adapter(backend, call).name
+
+
 def _build_local_mask(
     seq_q: int,
     seq_k: int,
