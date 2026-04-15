@@ -1,3 +1,4 @@
+import importlib
 import math
 import os
 from typing import Optional, Tuple
@@ -8,14 +9,112 @@ from .utils import get_default_args
 
 try:
     from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+
     HAS_FLASH_ATTN = True
 except ImportError:
     _flash_attn_forward = None
     _flash_attn_backward = None
     HAS_FLASH_ATTN = False
 
-_VALID_BACKENDS = {"auto", "flash_attn", "portable"}
+_VALID_BACKENDS = {"auto", "flash_attn", "fused", "portable"}
 _BACKEND = os.environ.get("RINGX_ATTN_BACKEND", "auto")
+
+_FUSED_MODULE = None
+_FUSED_ATTN = None
+_FUSED_IMPORT_ERROR = None
+_FUSED_HEAD_DIMS = {16, 32, 64, 128, 256}
+
+
+def _load_fused_module():
+    global _FUSED_MODULE, _FUSED_ATTN, _FUSED_IMPORT_ERROR
+    if _FUSED_MODULE is not None:
+        return _FUSED_MODULE
+    if _FUSED_IMPORT_ERROR is not None:
+        return None
+
+    try:
+        _FUSED_MODULE = importlib.import_module("ringX_attn.fused_attention")
+        _FUSED_ATTN = _FUSED_MODULE.attention
+    except Exception as exc:
+        _FUSED_IMPORT_ERROR = exc
+        _FUSED_MODULE = None
+        _FUSED_ATTN = None
+    return _FUSED_MODULE
+
+
+def _load_fused_attn():
+    module = _load_fused_module()
+    return None if module is None else _FUSED_ATTN
+
+
+def _fused_import_error_message() -> str:
+    if _FUSED_IMPORT_ERROR is None:
+        return "the optional Triton fused attention module is not available."
+    return f"the optional Triton fused attention module could not be imported: {_FUSED_IMPORT_ERROR}"
+
+
+def _fused_support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    if _load_fused_attn() is None:
+        return _fused_import_error_message()
+    if q.device.type != "cuda":
+        return "fused backend requires CUDA-compatible tensors."
+    if dropout_p != 0:
+        return "fused backend currently supports dropout_p=0 only."
+    if alibi_slopes is not None:
+        return "fused backend does not support alibi_slopes."
+    if window_size != (-1, -1):
+        return "fused backend does not support local window attention."
+    if q.shape[:3] != k.shape[:3] or q.shape[:3] != v.shape[:3]:
+        return "fused backend requires q, k, and v to share the same batch, sequence, and head dimensions."
+    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        return "fused backend requires q, k, and v to share the same head dimension."
+    if q.shape[-1] not in _FUSED_HEAD_DIMS:
+        return f"fused backend requires head_dim in {sorted(_FUSED_HEAD_DIMS)}."
+    if q.shape[1] % 128 != 0:
+        return "fused backend currently requires sequence length to be a multiple of 128."
+    if q.dtype not in {torch.float16, torch.bfloat16}:
+        return "fused backend currently supports float16 and bfloat16 tensors only."
+    return None
+
+
+def _runtime_backend(
+    backend: Optional[str],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+) -> str:
+    requested = _BACKEND if backend is None else backend
+    selected = resolve_backend(backend)
+    if selected != "fused":
+        return selected
+
+    fused_error = _fused_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+    if fused_error is None:
+        return "fused"
+    if requested == "auto":
+        return "portable"
+    raise RuntimeError(
+        "backend='fused' was requested, but the current attention call is not supported: "
+        f"{fused_error} Use backend='portable', call set_backend('portable'), or set "
+        "RINGX_ATTN_BACKEND=portable."
+    )
 
 
 def set_backend(backend: str) -> None:
@@ -34,18 +133,30 @@ def resolve_backend(backend: Optional[str] = None) -> str:
     if selected not in _VALID_BACKENDS:
         raise ValueError(f"Unsupported backend '{selected}'. Expected one of {_VALID_BACKENDS}.")
     if selected == "auto":
-        return "flash_attn" if HAS_FLASH_ATTN else "portable"
+        if HAS_FLASH_ATTN:
+            return "flash_attn"
+        if _load_fused_attn() is not None:
+            return "fused"
+        return "portable"
     if selected == "flash_attn" and not HAS_FLASH_ATTN:
         raise RuntimeError(
             "backend='flash_attn' was requested, but flash_attn is not installed. "
             "Use backend='portable', call set_backend('portable'), or set "
             "RINGX_ATTN_BACKEND=portable."
         )
+    if selected == "fused" and _load_fused_attn() is None:
+        raise RuntimeError(
+            "backend='fused' was requested, but "
+            f"{_fused_import_error_message()} "
+            "Install Triton support for this environment, or use backend='portable'."
+        )
     return selected
 
 
 def available_backends():
     backends = ["portable"]
+    if _load_fused_attn() is not None:
+        backends.append("fused")
     if HAS_FLASH_ATTN:
         backends.append("flash_attn")
     return tuple(backends)
@@ -168,6 +279,97 @@ def _flash_backward(
         }
     )
     _flash_attn_backward(**params)
+    return dq, dk, dv
+
+
+def _fused_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale,
+    dropout_p=0.0,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+):
+    error = _fused_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+    if error is not None:
+        raise RuntimeError(f"Unable to run fused backend: {error}")
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    fused_attn = _load_fused_attn()
+    assert fused_attn is not None
+
+    qh = q.permute(0, 2, 1, 3).contiguous()
+    kh = k.permute(0, 2, 1, 3).contiguous()
+    vh = v.permute(0, 2, 1, 3).contiguous()
+    out, lse = fused_attn(qh, kh, vh, causal, softmax_scale)
+    out = out.permute(0, 2, 1, 3).contiguous()
+    return out.to(q.dtype), lse.contiguous()
+
+
+
+def _fused_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_scale,
+    dropout_p=0.0,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+):
+    error = _fused_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+    if error is not None:
+        raise RuntimeError(f"Unable to run fused backend: {error}")
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    fused_module = _load_fused_module()
+    assert fused_module is not None
+
+    qh = q.permute(0, 2, 1, 3).contiguous()
+    kh = k.permute(0, 2, 1, 3).contiguous()
+    vh = v.permute(0, 2, 1, 3).contiguous()
+    douth = dout.permute(0, 2, 1, 3).contiguous()
+    outh = out.permute(0, 2, 1, 3).contiguous()
+    lse = softmax_lse.contiguous()
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.saved_tensors = (qh, kh, vh, outh, lse)
+    ctx.sm_scale = softmax_scale
+    ctx.HEAD_DIM = qh.shape[-1]
+    ctx.causal = causal
+
+    dqh, dkh, dvh, *_ = fused_module._attention.backward(ctx, douth, None)
+    dq = dqh.permute(0, 2, 1, 3).contiguous().to(q.dtype)
+    dk = dkh.permute(0, 2, 1, 3).contiguous().to(k.dtype)
+    dv = dvh.permute(0, 2, 1, 3).contiguous().to(v.dtype)
     return dq, dk, dv
 
 
@@ -367,9 +569,29 @@ def local_attn_forward(
     deterministic=False,
     backend: Optional[str] = None,
 ):
-    selected = resolve_backend(backend)
+    selected = _runtime_backend(
+        backend,
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
     if selected == "flash_attn":
         return _flash_forward(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+        )
+    if selected == "fused":
+        return _fused_forward(
             q,
             k,
             v,
@@ -408,9 +630,32 @@ def local_attn_backward(
     deterministic=False,
     backend: Optional[str] = None,
 ):
-    selected = resolve_backend(backend)
+    selected = _runtime_backend(
+        backend,
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
     if selected == "flash_attn":
         return _flash_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+        )
+    if selected == "fused":
+        return _fused_backward(
             dout,
             q,
             k,
