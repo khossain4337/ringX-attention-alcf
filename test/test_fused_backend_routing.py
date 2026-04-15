@@ -105,6 +105,77 @@ def test_explicit_fused_raises_for_unsupported_call():
             raise AssertionError("Expected backend='fused' unsupported call to raise RuntimeError")
 
 
+def test_fused_backward_uses_public_wrapper():
+    q, k, v = _sample_tensors()
+    dout = torch.randn_like(q)
+    out = torch.randn_like(q)
+    lse = torch.randn(q.shape[0], q.shape[2], q.shape[1])
+
+    calls = {}
+
+    class _FakeFusedModule:
+        def attention_backward(self, qh, kh, vh, outh, lseh, douth, causal, sm_scale):
+            calls["shapes"] = (qh.shape, kh.shape, vh.shape, outh.shape, lseh.shape, douth.shape)
+            calls["causal"] = causal
+            calls["sm_scale"] = sm_scale
+            return qh + 1, kh + 2, vh + 3
+
+    with patched_attrs(
+        backend,
+        _load_fused_attn=lambda: object(),
+        _load_fused_module=lambda: _FakeFusedModule(),
+        _fused_support_error=lambda *args, **kwargs: None,
+    ):
+        dq, dk, dv = backend.local_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            softmax_scale=0.125,
+            causal=True,
+            backend="fused",
+        )
+
+    assert calls["shapes"][0] == (q.shape[0], q.shape[2], q.shape[1], q.shape[3])
+    assert calls["shapes"][4] == lse.shape
+    assert calls["causal"] is True
+    assert calls["sm_scale"] == 0.125
+    assert dq.shape == q.shape
+    assert dk.shape == k.shape
+    assert dv.shape == v.shape
+
+
+def test_explicit_fused_backward_raises_for_unsupported_call():
+    q, k, v = _sample_tensors()
+    dout = torch.randn_like(q)
+    out = torch.randn_like(q)
+    lse = torch.randn(q.shape[0], q.shape[2], q.shape[1])
+
+    with patched_attrs(
+        backend,
+        _load_fused_attn=lambda: object(),
+        _fused_support_error=lambda *args, **kwargs: "fused backend currently supports dropout_p=0 only.",
+    ):
+        try:
+            backend.local_attn_backward(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                softmax_scale=None,
+                dropout_p=0.1,
+                backend="fused",
+            )
+        except RuntimeError as exc:
+            assert "backend='fused'" in str(exc)
+        else:
+            raise AssertionError("Expected backend='fused' unsupported backward call to raise RuntimeError")
+
+
 if __name__ == "__main__":
     initialized = _init_dist_if_needed()
     rank = _rank()
@@ -121,7 +192,14 @@ if __name__ == "__main__":
     if rank == 0:
         print("[ok] explicit fused backend raises for unsupported calls", flush=True)
 
+    test_fused_backward_uses_public_wrapper()
+    if rank == 0:
+        print("[ok] fused backward uses the public fused module wrapper", flush=True)
+
+    test_explicit_fused_backward_raises_for_unsupported_call()
+    if rank == 0:
+        print("[ok] explicit fused backward raises for unsupported calls", flush=True)
+
     _barrier()
     if initialized:
         dist.destroy_process_group()
-
