@@ -518,7 +518,7 @@ class _attention(torch.autograd.Function):
             desc_o = o
 
         def alloc_fn(size: int, align: int, _):
-            return torch.empty(size, dtype=torch.int8, device="cuda")
+            return torch.empty(size, dtype=torch.int8, device=q.device)
 
         triton.set_allocator(alloc_fn)
 
