@@ -89,6 +89,50 @@ def test_auto_falls_back_to_portable_when_fused_is_unsupported():
 
 
 
+def test_backend_delegates_support_checks_to_fused_module():
+    q, k, v = _sample_tensors()
+    portable_out = torch.full_like(q, 13.0)
+    portable_lse = torch.full((q.shape[0], q.shape[2], q.shape[1]), 6.0)
+    calls = {}
+
+    class _FakeFusedModule:
+        attention = object()
+
+        def support_error(self, q_, k_, v_, dropout_p=0.0, window_size=(-1, -1), alibi_slopes=None):
+            calls["shapes"] = (q_.shape, k_.shape, v_.shape)
+            calls["dtype"] = q_.dtype
+            calls["device_type"] = q_.device.type
+            calls["dropout_p"] = dropout_p
+            calls["window_size"] = window_size
+            calls["alibi_slopes"] = alibi_slopes
+            return "fused backend does not support local window attention."
+
+    with patched_attrs(
+        backend,
+        HAS_FLASH_ATTN=False,
+        _load_fused_module=lambda: _FakeFusedModule(),
+        _load_fused_attn=lambda: object(),
+        _portable_forward=lambda *args, **kwargs: (portable_out, portable_lse),
+    ):
+        out, lse = backend.local_attn_forward(
+            q,
+            k,
+            v,
+            softmax_scale=None,
+            window_size=(32, 32),
+            backend="auto",
+        )
+
+    assert out is portable_out
+    assert lse is portable_lse
+    assert calls["shapes"][0] == q.shape
+    assert calls["dtype"] == q.dtype
+    assert calls["device_type"] == q.device.type
+    assert calls["dropout_p"] == 0.0
+    assert calls["window_size"] == (32, 32)
+    assert calls["alibi_slopes"] is None
+
+
 def test_explicit_fused_raises_for_unsupported_call():
     q, k, v = _sample_tensors()
 
@@ -187,6 +231,10 @@ if __name__ == "__main__":
     test_auto_falls_back_to_portable_when_fused_is_unsupported()
     if rank == 0:
         print("[ok] auto falls back to portable when fused is unsupported", flush=True)
+
+    test_backend_delegates_support_checks_to_fused_module()
+    if rank == 0:
+        print("[ok] backend delegates fused support checks to the fused module", flush=True)
 
     test_explicit_fused_raises_for_unsupported_call()
     if rank == 0:
