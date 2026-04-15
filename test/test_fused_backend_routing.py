@@ -98,7 +98,7 @@ def test_backend_delegates_support_checks_to_fused_module():
     class _FakeFusedModule:
         attention = object()
 
-        def support_error(self, q_, k_, v_, dropout_p=0.0, window_size=(-1, -1), alibi_slopes=None):
+        def forward_support_error(self, q_, k_, v_, dropout_p=0.0, window_size=(-1, -1), alibi_slopes=None):
             calls["shapes"] = (q_.shape, k_.shape, v_.shape)
             calls["dtype"] = q_.dtype
             calls["device_type"] = q_.device.type
@@ -168,7 +168,7 @@ def test_fused_backward_uses_public_wrapper():
         backend,
         _load_fused_attn=lambda: object(),
         _load_fused_module=lambda: _FakeFusedModule(),
-        _fused_support_error=lambda *args, **kwargs: None,
+        _fused_backward_support_error=lambda *args, **kwargs: None,
     ):
         dq, dk, dv = backend.local_attn_backward(
             dout,
@@ -191,6 +191,70 @@ def test_fused_backward_uses_public_wrapper():
     assert dv.shape == v.shape
 
 
+def test_backend_delegates_backward_support_checks_to_fused_module():
+    q, k, v = _sample_tensors()
+    dout = torch.randn_like(q)
+    out = torch.randn_like(q)
+    lse = torch.randn(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32)
+    portable_grads = tuple(torch.full_like(tensor, fill_value) for tensor, fill_value in ((q, 17.0), (k, 19.0), (v, 23.0)))
+    calls = {}
+
+    class _FakeFusedModule:
+        attention = object()
+
+        def backward_support_error(
+            self,
+            dout_,
+            q_,
+            k_,
+            v_,
+            out_,
+            softmax_lse_,
+            dropout_p=0.0,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+        ):
+            calls["dout_shape"] = dout_.shape
+            calls["out_shape"] = out_.shape
+            calls["lse_shape"] = softmax_lse_.shape
+            calls["lse_dtype"] = softmax_lse_.dtype
+            calls["dropout_p"] = dropout_p
+            calls["window_size"] = window_size
+            calls["alibi_slopes"] = alibi_slopes
+            return "fused backend requires softmax_lse to have shape (1, 2, 128)."
+
+    with patched_attrs(
+        backend,
+        HAS_FLASH_ATTN=False,
+        _load_fused_module=lambda: _FakeFusedModule(),
+        _load_fused_attn=lambda: object(),
+        _portable_backward=lambda *args, **kwargs: portable_grads,
+    ):
+        dq, dk, dv = backend.local_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            softmax_scale=None,
+            window_size=(32, 32),
+            backend="auto",
+        )
+
+    assert dq is portable_grads[0]
+    assert dk is portable_grads[1]
+    assert dv is portable_grads[2]
+    assert calls["dout_shape"] == dout.shape
+    assert calls["out_shape"] == out.shape
+    assert calls["lse_shape"] == lse.shape
+    assert calls["lse_dtype"] == lse.dtype
+    assert calls["dropout_p"] == 0.0
+    assert calls["window_size"] == (32, 32)
+    assert calls["alibi_slopes"] is None
+
+
+
 def test_explicit_fused_backward_raises_for_unsupported_call():
     q, k, v = _sample_tensors()
     dout = torch.randn_like(q)
@@ -200,7 +264,7 @@ def test_explicit_fused_backward_raises_for_unsupported_call():
     with patched_attrs(
         backend,
         _load_fused_attn=lambda: object(),
-        _fused_support_error=lambda *args, **kwargs: "fused backend currently supports dropout_p=0 only.",
+        _fused_backward_support_error=lambda *args, **kwargs: "fused backend currently supports dropout_p=0 only.",
     ):
         try:
             backend.local_attn_backward(
@@ -243,6 +307,10 @@ if __name__ == "__main__":
     test_fused_backward_uses_public_wrapper()
     if rank == 0:
         print("[ok] fused backward uses the public fused module wrapper", flush=True)
+
+    test_backend_delegates_backward_support_checks_to_fused_module()
+    if rank == 0:
+        print("[ok] backend delegates fused backward support checks to the fused module", flush=True)
 
     test_explicit_fused_backward_raises_for_unsupported_call()
     if rank == 0:
