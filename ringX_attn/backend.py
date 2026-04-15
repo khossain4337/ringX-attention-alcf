@@ -357,16 +357,16 @@ def _fused_backward(
     outh = out.permute(0, 2, 1, 3).contiguous()
     lse = softmax_lse.contiguous()
 
-    class _Ctx:
-        pass
-
-    ctx = _Ctx()
-    ctx.saved_tensors = (qh, kh, vh, outh, lse)
-    ctx.sm_scale = softmax_scale
-    ctx.HEAD_DIM = qh.shape[-1]
-    ctx.causal = causal
-
-    dqh, dkh, dvh, *_ = fused_module._attention.backward(ctx, douth, None)
+    dqh, dkh, dvh = fused_module.attention_backward(
+        qh,
+        kh,
+        vh,
+        outh,
+        lse,
+        douth,
+        causal=causal,
+        sm_scale=softmax_scale,
+    )
     dq = dqh.permute(0, 2, 1, 3).contiguous().to(q.dtype)
     dk = dkh.permute(0, 2, 1, 3).contiguous().to(k.dtype)
     dv = dvh.permute(0, 2, 1, 3).contiguous().to(v.dtype)
