@@ -74,39 +74,45 @@ def is_hopper():
 SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 SUPPORTED_HEAD_DIMS = frozenset({16, 32, 64, 128, 256})
 REQUIRED_SEQUENCE_MULTIPLE = 128
+EXPECTED_LSE_DTYPE = torch.float32
 ACTIVE_TRITON_BACKEND = triton.runtime.driver.active.get_current_target().backend
 ACTIVE_TORCH_DEVICE_TYPE = DEVICE.type
 
 
-def support_error(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float = 0.0,
-    window_size: Tuple[int, int] = (-1, -1),
-    alibi_slopes=None,
-) -> Optional[str]:
-    """Validate a ringX backend attention call before dispatching the Triton kernel.
+def _supported_dtype_names() -> str:
+    return ", ".join(sorted(str(dtype).replace("torch.", "") for dtype in SUPPORTED_DTYPES))
 
-    This integration hook expects tensors in ringX's local-attention layout
-    ``(batch, seqlen, heads, head_dim)``. The actual Triton kernel entry point
-    still consumes ``(batch, heads, seqlen, head_dim)`` after the caller
-    permutes the tensors.
-    """
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        return "fused backend expects q, k, and v to be 4D tensors with shape (batch, seqlen, heads, head_dim)."
-    if q.device != k.device or q.device != v.device:
-        return "fused backend requires q, k, and v to be on the same device."
+
+def _device_error(q: torch.Tensor, *others: torch.Tensor) -> Optional[str]:
+    for tensor in others:
+        if q.device != tensor.device:
+            return "fused backend requires all attention tensors to be on the same device."
     if q.device.type != ACTIVE_TORCH_DEVICE_TYPE:
         return (
             "fused backend requires tensors on the active Triton device type "
             f"'{ACTIVE_TORCH_DEVICE_TYPE}' (current Triton backend: {ACTIVE_TRITON_BACKEND})."
         )
+    return None
+
+
+def _qkv_support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return "fused backend expects q, k, and v to be 4D tensors with shape (batch, seqlen, heads, head_dim)."
+    device_error = _device_error(q, k, v)
+    if device_error is not None:
+        return device_error
     if q.dtype != k.dtype or q.dtype != v.dtype:
         return "fused backend requires q, k, and v to share the same dtype."
     if q.dtype not in SUPPORTED_DTYPES:
-        supported = ", ".join(sorted(str(dtype).replace("torch.", "") for dtype in SUPPORTED_DTYPES))
-        return f"fused backend currently supports {supported} tensors only."
+        return f"fused backend currently supports {_supported_dtype_names()} tensors only."
     if dropout_p != 0:
         return "fused backend currently supports dropout_p=0 only."
     if alibi_slopes is not None:
@@ -127,8 +133,89 @@ def support_error(
     return None
 
 
+def forward_support_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    """Validate a ringX backend forward attention call before dispatching Triton.
+
+    This integration hook expects tensors in ringX's local-attention layout
+    ``(batch, seqlen, heads, head_dim)``. The actual Triton kernel entry point
+    still consumes ``(batch, heads, seqlen, head_dim)`` after the caller
+    permutes the tensors.
+    """
+    return _qkv_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+
+
+def backward_support_error(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dropout_p: float = 0.0,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes=None,
+) -> Optional[str]:
+    """Validate a ringX backend backward attention call before Triton dispatch."""
+    qkv_error = _qkv_support_error(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+    )
+    if qkv_error is not None:
+        return qkv_error
+    if dout.ndim != 4 or out.ndim != 4:
+        return "fused backend expects dout and out to be 4D tensors with shape (batch, seqlen, heads, head_dim)."
+    device_error = _device_error(q, dout, out, softmax_lse)
+    if device_error is not None:
+        return device_error
+    if dout.shape != q.shape:
+        return "fused backend requires dout to have the same shape as q."
+    if out.shape != q.shape:
+        return "fused backend requires out to have the same shape as q."
+    if dout.dtype != q.dtype or out.dtype != q.dtype:
+        return "fused backend requires dout and out to share q's dtype."
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    if softmax_lse.ndim != 3 or softmax_lse.shape != expected_lse_shape:
+        return (
+            "fused backend requires softmax_lse to have shape "
+            f"{expected_lse_shape}."
+        )
+    if softmax_lse.dtype != EXPECTED_LSE_DTYPE:
+        return (
+            "fused backend requires softmax_lse to use dtype "
+            f"{EXPECTED_LSE_DTYPE}."
+        )
+    return None
+
+
+def support_error(*args, **kwargs) -> Optional[str]:
+    """Backward-compatible alias for the fused forward support contract."""
+    return forward_support_error(*args, **kwargs)
+
+
 def supports_attention_call(*args, **kwargs) -> bool:
-    return support_error(*args, **kwargs) is None
+    return forward_support_error(*args, **kwargs) is None
+
+
+def supports_backward_call(*args, **kwargs) -> bool:
+    return backward_support_error(*args, **kwargs) is None
 
 
 # ---------------------------------------------------------------------------
