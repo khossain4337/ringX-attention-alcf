@@ -377,6 +377,7 @@ def _attn_bwd(Q, K, V, sm_scale,
               BLOCK_N2: tl.constexpr,
               BLK_SLICE_FACTOR: tl.constexpr,
               HEAD_DIM: tl.constexpr,
+              MATMUL_BF16: tl.constexpr,
               CAUSAL: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996
 
@@ -418,6 +419,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                                  stride_tok, stride_d,
                                  H, N_CTX,
                                  MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,
+                                 MATMUL_BF16,
                                  start_n, start_m, num_steps,
                                  MASK=True)
         start_m += num_steps * MASK_BLOCK_M1
@@ -430,6 +432,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                              stride_tok, stride_d,
                              H, N_CTX,
                              BLOCK_M1, BLOCK_N1, HEAD_DIM,
+                             MATMUL_BF16,
                              start_n, start_m, num_steps,
                              MASK=False)
 
@@ -462,6 +465,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                           stride_tok, stride_d,
                           H, N_CTX,
                           BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,
+                          MATMUL_BF16,
                           start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,
                           MASK=True)
         end_n -= num_steps * MASK_BLOCK_N2
@@ -473,6 +477,7 @@ def _attn_bwd(Q, K, V, sm_scale,
                       stride_tok, stride_d,
                       H, N_CTX,
                       BLOCK_M2, BLOCK_N2, HEAD_DIM,
+                      MATMUL_BF16,
                       start_m, start_n, num_steps,
                       MASK=False)
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -602,7 +607,26 @@ class _attention(torch.autograd.Function):
             num_stages=NUM_STAGES,
             CAUSAL=ctx.causal,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None
+
+
+def attention_backward(q, k, v, o, M, do, causal, sm_scale):
+    """Run the fused attention backward kernel using explicit saved tensors.
+
+    This keeps callers from depending on the private ``_attention`` autograd
+    context layout directly.
+    """
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.saved_tensors = (q, k, v, o, M)
+    ctx.sm_scale = sm_scale
+    ctx.HEAD_DIM = q.shape[-1]
+    ctx.causal = causal
+    grads = _attention.backward(ctx, do, None)
+    dq, dk, dv = grads[:3]
+    return dq, dk, dv
 
 
 attention = _attention.apply
