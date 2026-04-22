@@ -10,6 +10,8 @@ import torch.distributed as dist
 
 from ringX_attn import backend as ringx_backend
 
+_DEVICE_TYPE = os.environ.get("DEVICE_TYPE", "cuda")
+
 try:
     from ring_flash_attn import (
         ring_flash_attn_func,
@@ -525,7 +527,8 @@ if __name__ == "__main__":
         help="Tensor dtype to benchmark.",
     )
     parser.add_argument("--profile", action="store_true", help="Enable profiling.")
-    dist.init_process_group("nccl", timeout=timedelta(seconds=36000))
+    _dist_backend = "xccl" if _DEVICE_TYPE == "xpu" else "nccl"
+    dist.init_process_group(_dist_backend, timeout=timedelta(seconds=36000))
     rank = dist.get_rank()
     args = parser.parse_args()
 
