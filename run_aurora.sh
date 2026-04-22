@@ -4,6 +4,8 @@
 REPO_DIR=/lus/flare/projects/datasets/softwares/testing/incite_2026_ringx/ringX-attention-alcf
 export PYTHONPATH=${REPO_DIR}:${PYTHONPATH}
 
+export DEVICE_TYPE=xpu
+
 export CCL_PROCESS_LAUNCHER=torchrun
 
 module add frameworks
