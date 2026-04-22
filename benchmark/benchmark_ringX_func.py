@@ -583,7 +583,7 @@ if __name__ == "__main__":
     try:
         for mode in modes:
             for func in impls:
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache() if _DEVICE_TYPE == "xpu" else torch.cuda.empty_cache()
                 if rank == 0:
                     print(f"# {func.__name__} [{mode}]")
                 try:
