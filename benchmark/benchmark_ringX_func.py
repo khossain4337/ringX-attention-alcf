@@ -12,6 +12,19 @@ from ringX_attn import backend as ringx_backend
 
 _DEVICE_TYPE = os.environ.get("DEVICE_TYPE", "cuda")
 
+
+def _make_event():
+    if _DEVICE_TYPE == "xpu":
+        return torch.xpu.Event(enable_timing=True)
+    return torch.cuda.Event(enable_timing=True)
+
+
+def _synchronize(device=None):
+    if _DEVICE_TYPE == "xpu":
+        torch.xpu.synchronize(device=device)
+    else:
+        torch.cuda.synchronize(device=device)
+
 try:
     from ring_flash_attn import (
         ring_flash_attn_func,
@@ -215,8 +228,8 @@ def _warmup(mode, func, q, k, v, dout, *, warmup_iter, causal, deterministic):
 
 
 def _measure_forward(func, q, k, v, *, num_iter, causal, deterministic, profile=False, profiler=None):
-    begin = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    begin = _make_event()
+    end = _make_event()
     begin.record()
     with torch.no_grad():
         for _ in range(num_iter):
@@ -224,14 +237,14 @@ def _measure_forward(func, q, k, v, *, num_iter, causal, deterministic, profile=
             if profile and profiler is not None:
                 profiler.step()
     end.record()
-    torch.cuda.synchronize(device=q.device)
+    _synchronize(device=q.device)
     return begin.elapsed_time(end) / 1000.0
 
 
 
 def _measure_forward_backward(func, q, k, v, dout, *, num_iter, causal, deterministic, profile=False, profiler=None):
-    begin = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    begin = _make_event()
+    end = _make_event()
     begin.record()
     for _ in range(num_iter):
         _zero_grads(q, k, v)
@@ -240,7 +253,7 @@ def _measure_forward_backward(func, q, k, v, dout, *, num_iter, causal, determin
         if profile and profiler is not None:
             profiler.step()
     end.record()
-    torch.cuda.synchronize(device=q.device)
+    _synchronize(device=q.device)
     return begin.elapsed_time(end) / 1000.0
 
 
@@ -250,13 +263,13 @@ def _measure_backward(func, q, k, v, dout, *, num_iter, causal, deterministic, p
     for _ in range(num_iter):
         _zero_grads(q, k, v)
         out = _run_forward(func, q, k, v, causal, deterministic)
-        torch.cuda.synchronize(device=q.device)
-        begin = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        _synchronize(device=q.device)
+        begin = _make_event()
+        end = _make_event()
         begin.record()
         out.backward(dout)
         end.record()
-        torch.cuda.synchronize(device=q.device)
+        _synchronize(device=q.device)
         total_ms += begin.elapsed_time(end)
         if profile and profiler is not None:
             profiler.step()
