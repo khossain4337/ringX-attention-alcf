@@ -269,8 +269,11 @@ def benchmark(args, func, warmup_iter=1, num_iter=100, mode="forward", log=True,
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
+    device = torch.device(f"{_DEVICE_TYPE}:{local_rank}")
+    if _DEVICE_TYPE == "xpu":
+        torch.xpu.set_device(device)
+    else:
+        torch.cuda.set_device(device)
 
     batch_size = args.batch_size
     deterministic = False
