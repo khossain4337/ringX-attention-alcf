@@ -27,6 +27,8 @@ Tensor layout: (batch, heads, seqlen, head_dim)
   NOTE: ringX_attn uses (batch, seqlen, heads, head_dim) — transpose at call site.
 """
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -690,6 +692,88 @@ def _attn_bwd(Q, K, V, sm_scale,
 
 
 # ---------------------------------------------------------------------------
+# Backward autotuner cache persistence
+#
+# Set TRITON_AUTOTUNE_CACHE_DIR to a persistent directory (e.g. on Lustre)
+# to save and reload the best backward configs across torchrun invocations.
+# On the first run the autotuner times all configs and saves the winner;
+# on subsequent runs the winner is loaded at import time and the autotuner
+# skips all timing runs entirely.
+#
+# Writes are atomic (temp file + os.replace) and rank-0-only to avoid
+# concurrent write races in multi-GPU launches.
+# ---------------------------------------------------------------------------
+
+_BWD_CACHE_DIR = os.environ.get("TRITON_AUTOTUNE_CACHE_DIR")
+_BWD_CACHE_FILE = (
+    os.path.join(_BWD_CACHE_DIR, "attn_bwd_autotune.json")
+    if _BWD_CACHE_DIR else None
+)
+_bwd_saved_keys: set = set()
+_bwd_cache_loaded: bool = False
+
+
+def _save_bwd_autotune_cache() -> None:
+    if _BWD_CACHE_FILE is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    new_keys = set(_attn_bwd.cache.keys()) - _bwd_saved_keys
+    if not new_keys:
+        return
+    cache_data = {}
+    for key, cfg in _attn_bwd.cache.items():
+        cache_data[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+        }
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+    tmp = _BWD_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache_data, f, indent=2)
+    os.replace(tmp, _BWD_CACHE_FILE)
+    _bwd_saved_keys.update(new_keys)
+
+
+def _load_bwd_autotune_cache() -> None:
+    """Load saved autotune configs into _attn_bwd.cache.
+
+    Called lazily on the first backward pass so that torch.distributed is
+    already initialized. Rank 0 reads the file; the result is broadcast to
+    all other ranks so only one process hits Lustre.
+    """
+    global _bwd_cache_loaded
+    if _bwd_cache_loaded:
+        return
+    _bwd_cache_loaded = True
+
+    if _BWD_CACHE_FILE is None:
+        return
+
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 and os.path.exists(_BWD_CACHE_FILE):
+            with open(_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        if os.path.exists(_BWD_CACHE_FILE):
+            with open(_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_bwd.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Python autograd wrapper
 # KEY CHANGE: forward() now returns (o, M) so LSE is available to callers
 # (e.g. ring attention algorithms that need it for the reduce step)
@@ -795,6 +879,7 @@ class _attention(torch.autograd.Function):
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
         )
 
+        _load_bwd_autotune_cache()
         bwd_grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_N1']), 1, BATCH * N_HEAD)
         _attn_bwd[bwd_grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
@@ -806,6 +891,7 @@ class _attention(torch.autograd.Function):
             MATMUL_BF16=q.dtype == torch.bfloat16,
             CAUSAL=ctx.causal,
         )
+        _save_bwd_autotune_cache()
 
         return dq, dk, dv, None, None, None
 
