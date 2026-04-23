@@ -827,7 +827,8 @@ class _attention(torch.autograd.Function):
                 f"[bwd timing] N_CTX={N_CTX}"
                 f"  preprocess={t1-t0:.4f}s"
                 f"  _attn_bwd={t2-t1:.4f}s"
-                f"  total={t2-t0:.4f}s",
+                f"  total={t2-t0:.4f}s"
+                f"  best_config={_attn_bwd.best_config}",
                 flush=True,
             )
 
