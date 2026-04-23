@@ -768,8 +768,6 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, dM=None):
-        import time
-
         q, k, v, o, M = ctx.saved_tensors
         do = do.contiguous()
         q = q.contiguous()
@@ -790,22 +788,12 @@ class _attention(torch.autograd.Function):
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
 
-        def _sync():
-            if ACTIVE_TORCH_DEVICE_TYPE == "xpu":
-                torch.xpu.synchronize()
-            else:
-                torch.cuda.synchronize()
-
-        _sync()
-        t0 = time.perf_counter()
         _attn_bwd_preprocess[pre_grid](
             o, do,
             delta,
             BATCH, N_HEAD, N_CTX,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
         )
-        _sync()
-        t1 = time.perf_counter()
 
         bwd_grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_N1']), 1, BATCH * N_HEAD)
         _attn_bwd[bwd_grid](
@@ -818,19 +806,6 @@ class _attention(torch.autograd.Function):
             MATMUL_BF16=q.dtype == torch.bfloat16,
             CAUSAL=ctx.causal,
         )
-        _sync()
-        t2 = time.perf_counter()
-
-        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        if _rank == 0:
-            print(
-                f"[bwd timing] N_CTX={N_CTX}"
-                f"  preprocess={t1-t0:.4f}s"
-                f"  _attn_bwd={t2-t1:.4f}s"
-                f"  total={t2-t0:.4f}s"
-                f"  best_config={_attn_bwd.best_config}",
-                flush=True,
-            )
 
         return dq, dk, dv, None, None, None
 
