@@ -23,13 +23,21 @@ module add frameworks
 
 #BACKEND=fused BENCHMARK_MODES="forward backward fwd_bwd" ./script/run_benchmarks.sh
 
-BACKEND=fused ALGOS="ringX_attn.ringX1_attn" \
-    BENCHMARK_MODES="forward backward fwd_bwd" \
+BACKEND=portable ALGOS="ringX_attn.ringX2_attn" \
+    BENCHMARK_MODES="backward" BATCH_SIZE=32 \
     NPROC=4 ./script/run_benchmarks.sh
 
-BACKEND=portable ALGOS="ringX_attn.ringX1_attn" \
-    BENCHMARK_MODES="forward backward fwd_bwd" \
+BACKEND=fused ALGOS="ringX_attn.ringX2_attn" \
+    BENCHMARK_MODES="backward" BATCH_SIZE=32 \
     NPROC=4 ./script/run_benchmarks.sh
+
+#BACKEND=fused ALGOS="ringX_attn.ringX1_attn" \
+#    BENCHMARK_MODES="forward backward fwd_bwd" \
+#    NPROC=4 ./script/run_benchmarks.sh
+#
+#BACKEND=portable ALGOS="ringX_attn.ringX1_attn" \
+#    BENCHMARK_MODES="forward backward fwd_bwd" \
+#    NPROC=4 ./script/run_benchmarks.sh
 
 #BACKEND=fused ALGOS="ringX_attn.ringX2_attn" \
 #    BENCHMARK_MODES="forward backward fwd_bwd" \
