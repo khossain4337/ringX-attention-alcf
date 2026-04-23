@@ -29,18 +29,18 @@ conda activate base
 #    BENCHMARK_MODES="forward backward fwd_bwd" \
 #    NPROC=4 ./script/run_benchmarks.sh
 #
-#BACKEND=portable ALGOS="ringX_attn.ringX1_attn" \
-#    BENCHMARK_MODES="forward backward fwd_bwd" \
-#    NPROC=4 ./script/run_benchmarks.sh
+BACKEND=portable ALGOS="ringX_attn.ringX2_attn" \
+    BENCHMARK_MODES="backward" BATCH_SIZE=4 \
+    NPROC=1 ./script/run_benchmarks.sh
 
-#BACKEND=fused ALGOS="ringX_attn.ringX2_attn" \
-#    BENCHMARK_MODES="forward backward fwd_bwd" \
-#    NPROC=4 ./script/run_benchmarks.sh
+BACKEND=fused ALGOS="ringX_attn.ringX2_attn" \
+    BENCHMARK_MODES="backward" BATCH_SIZE=4 \
+    NPROC=1 ./script/run_benchmarks.sh
 #
 #BACKEND=portable ALGOS="ringX_attn.ringX2_attn" \
 #    BENCHMARK_MODES="forward backward fwd_bwd" \
 #    NPROC=4 ./script/run_benchmarks.sh
 
-BACKEND=flash_attn ALGOS="ringX_attn.ringX2_attn" \
-    BENCHMARK_MODES="forward backward fwd_bwd" \
-    NPROC=4 ./script/run_benchmarks.sh
+#BACKEND=flash_attn ALGOS="ringX_attn.ringX2_attn" \
+#    BENCHMARK_MODES="forward backward fwd_bwd" \
+#    NPROC=4 ./script/run_benchmarks.sh
