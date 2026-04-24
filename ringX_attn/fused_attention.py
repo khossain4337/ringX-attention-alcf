@@ -721,18 +721,52 @@ def _save_bwd_autotune_cache() -> None:
     new_keys = set(_attn_bwd.cache.keys()) - _bwd_saved_keys
     if not new_keys:
         return
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+
+    # Save winner cache (used for fast reload on subsequent runs).
     cache_data = {}
     for key, cfg in _attn_bwd.cache.items():
         cache_data[json.dumps(list(key))] = {
             "kwargs": cfg.kwargs,
             "num_warps": cfg.num_warps,
             "num_stages": cfg.num_stages,
+            "time_ms": getattr(cfg, "time", None),
         }
-    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
     tmp = _BWD_CACHE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cache_data, f, indent=2)
     os.replace(tmp, _BWD_CACHE_FILE)
+
+    # Save full ranking for each new key so we can verify the winner is
+    # meaningfully faster than the runner-up (guards against noisy timing).
+    # _attn_bwd.configs holds all Config objects with .time set from the most
+    # recent autotune sweep — valid when one new key is added per invocation,
+    # which matches our one-seqlen-per-torchrun benchmark setup.
+    ranking_file = _BWD_CACHE_FILE.replace(".json", "_ranking.json")
+    try:
+        existing = {}
+        if os.path.exists(ranking_file):
+            with open(ranking_file) as f:
+                existing = json.load(f)
+        sorted_cfgs = sorted(_attn_bwd.configs, key=lambda c: getattr(c, "time", float("inf")))
+        for key in new_keys:
+            existing[json.dumps(list(key))] = [
+                {
+                    "rank": i + 1,
+                    "time_ms": getattr(c, "time", None),
+                    "kwargs": c.kwargs,
+                    "num_warps": c.num_warps,
+                    "num_stages": c.num_stages,
+                }
+                for i, c in enumerate(sorted_cfgs)
+            ]
+        tmp = ranking_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, ranking_file)
+    except Exception:
+        pass  # ranking is informational only — never break the main cache save
+
     _bwd_saved_keys.update(new_keys)
 
 
