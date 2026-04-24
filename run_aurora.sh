@@ -2,6 +2,7 @@
 #
 #
 REPO_DIR=/lus/flare/projects/datasets/softwares/testing/incite_2026_ringx/ringX-attention-alcf
+export TRITON_AUTOTUNE_CACHE_DIR=/lus/flare/projects/datasets/softwares/testing/incite_2026_ringx/triton_autotune_cache
 export PYTHONPATH=${REPO_DIR}:${PYTHONPATH}
 
 export DEVICE_TYPE=xpu
