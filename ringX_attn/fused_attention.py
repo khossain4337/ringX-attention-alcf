@@ -723,14 +723,20 @@ def _save_bwd_autotune_cache() -> None:
         return
     os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
 
+    # configs_timings is set on the Autotuner by run() after each fresh sweep:
+    #   self.configs_timings = {config: (median_ms, p20_ms, p80_ms), ...}
+    # Only present after a real autotune (not on cache-loaded runs).
+    timings = getattr(_attn_bwd, "configs_timings", {})
+
     # Save winner cache (used for fast reload on subsequent runs).
     cache_data = {}
     for key, cfg in _attn_bwd.cache.items():
+        t = timings.get(cfg)
         cache_data[json.dumps(list(key))] = {
             "kwargs": cfg.kwargs,
             "num_warps": cfg.num_warps,
             "num_stages": cfg.num_stages,
-            "time_ms": getattr(cfg, "time", None),
+            "time_ms": t[0] if t is not None else None,
         }
     tmp = _BWD_CACHE_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -739,21 +745,23 @@ def _save_bwd_autotune_cache() -> None:
 
     # Save full ranking for each new key so we can verify the winner is
     # meaningfully faster than the runner-up (guards against noisy timing).
-    # _attn_bwd.configs holds all Config objects with .time set from the most
-    # recent autotune sweep — valid when one new key is added per invocation,
-    # which matches our one-seqlen-per-torchrun benchmark setup.
     ranking_file = _BWD_CACHE_FILE.replace(".json", "_ranking.json")
     try:
         existing = {}
         if os.path.exists(ranking_file):
             with open(ranking_file) as f:
                 existing = json.load(f)
-        sorted_cfgs = sorted(_attn_bwd.configs, key=lambda c: getattr(c, "time", float("inf")))
+        sorted_cfgs = sorted(
+            timings.keys(),
+            key=lambda c: timings[c][0] if timings.get(c) is not None else float("inf"),
+        ) if timings else _attn_bwd.configs
         for key in new_keys:
             existing[json.dumps(list(key))] = [
                 {
                     "rank": i + 1,
-                    "time_ms": getattr(c, "time", None),
+                    "time_ms_median": timings[c][0] if timings.get(c) is not None else None,
+                    "time_ms_p20":    timings[c][1] if timings.get(c) is not None else None,
+                    "time_ms_p80":    timings[c][2] if timings.get(c) is not None else None,
                     "kwargs": c.kwargs,
                     "num_warps": c.num_warps,
                     "num_stages": c.num_stages,
