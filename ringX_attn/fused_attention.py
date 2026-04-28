@@ -813,6 +813,9 @@ def _load_bwd_autotune_cache() -> None:
             num_stages=cfg_dict["num_stages"],
             num_warps=cfg_dict["num_warps"],
         )
+    # Mark loaded keys as already-saved so _save_bwd_autotune_cache does not
+    # overwrite them with time_ms=null on cache-hit runs (no fresh timing).
+    _bwd_saved_keys.update(_attn_bwd.cache.keys())
 
 
 # ---------------------------------------------------------------------------
