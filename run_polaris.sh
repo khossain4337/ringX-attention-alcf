@@ -2,6 +2,7 @@
 #
 #
 REPO_DIR=/lus/eagle/projects/datascience/hossainm/testing/incite_2026_ringx/ringX-attention-alcf
+export TRITON_AUTOTUNE_CACHE_DIR=/lus/eagle/projects/datascience/hossainm/testing/incite_2026_ringx/triton_autotune_cache_a100
 export PYTHONPATH=${REPO_DIR}:${PYTHONPATH}
 
 export DEVICE_TYPE=cuda
@@ -23,19 +24,20 @@ conda activate base
 #NPROC=4 \
 #./script/run_benchmarks.sh
 
+RINGX_ATTN_BACKEND=fused python ./test/check_single_pass_correctness.py
 #BACKEND=fused BENCHMARK_MODES="forward backward fwd_bwd" ./script/run_benchmarks.sh
 
 #BACKEND=fused ALGOS="ringX_attn.ringX1_attn" \
 #    BENCHMARK_MODES="forward backward fwd_bwd" \
 #    NPROC=4 ./script/run_benchmarks.sh
 #
-BACKEND=portable ALGOS="ringX_attn.ringX2_attn" \
-    BENCHMARK_MODES="backward" BATCH_SIZE=32 \
-    NPROC=4 ./script/run_benchmarks.sh
-
-BACKEND=fused ALGOS="ringX_attn.ringX2_attn" \
-    BENCHMARK_MODES="backward" BATCH_SIZE=32 \
-    NPROC=4 ./script/run_benchmarks.sh
+#BACKEND=portable ALGOS="ringX_attn.ringX2_attn" \
+#    BENCHMARK_MODES="backward" BATCH_SIZE=32 \
+#    NPROC=4 ./script/run_benchmarks.sh
+#
+#BACKEND=fused ALGOS="ringX_attn.ringX2_attn" \
+#    BENCHMARK_MODES="backward" BATCH_SIZE=32 \
+#    NPROC=4 ./script/run_benchmarks.sh
 #
 #BACKEND=portable ALGOS="ringX_attn.ringX2_attn" \
 #    BENCHMARK_MODES="forward backward fwd_bwd" \
