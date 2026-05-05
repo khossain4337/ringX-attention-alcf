@@ -80,7 +80,6 @@ def _current_backend_name(func):
 
 
 _FUSED_BENCHMARK_UNSUPPORTED_ALGOS = {
-    "ringX3_attn": "ringX3_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
     "ringX4_attn": "ringX4_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
     "ringX4o_attn": "ringX4o_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
 }
@@ -487,6 +486,7 @@ def _emit_result(args, func, mode, result):
         "requested_backend": result["requested_backend"],
         "forward_backend": result["forward_backend"],
         "backward_backend": result["backward_backend"],
+        "bwd_kernel": os.environ.get("RINGX_ATTN_BWD_KERNEL", "two_phase"),
         "causal": args.causal,
         "batch": args.batch_size,
         "seqlen": args.seq_length,

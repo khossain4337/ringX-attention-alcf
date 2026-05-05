@@ -122,15 +122,25 @@ def _qkv_support_error(
         return "fused backend does not support alibi_slopes."
     if window_size != (-1, -1):
         return "fused backend does not support local window attention."
-    if q.shape[:3] != k.shape[:3] or q.shape[:3] != v.shape[:3]:
-        return "fused backend requires q, k, and v to share the same batch, sequence, and head dimensions."
+    # batch and head count must match; seqlen may differ (asymmetric cross-attention)
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        return "fused backend requires q, k, and v to share the same batch size."
+    if q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2]:
+        return "fused backend requires q, k, and v to share the same number of heads."
+    if k.shape[1] != v.shape[1]:
+        return "fused backend requires k and v to share the same sequence length."
     if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
         return "fused backend requires q, k, and v to share the same head dimension."
     if q.shape[-1] not in SUPPORTED_HEAD_DIMS:
         return f"fused backend requires head_dim in {sorted(SUPPORTED_HEAD_DIMS)}."
     if q.shape[1] % REQUIRED_SEQUENCE_MULTIPLE != 0:
         return (
-            "fused backend currently requires sequence length to be a multiple of "
+            "fused backend currently requires q sequence length to be a multiple of "
+            f"{REQUIRED_SEQUENCE_MULTIPLE}."
+        )
+    if k.shape[1] % REQUIRED_SEQUENCE_MULTIPLE != 0:
+        return (
+            "fused backend currently requires k/v sequence length to be a multiple of "
             f"{REQUIRED_SEQUENCE_MULTIPLE}."
         )
     return None
@@ -366,10 +376,10 @@ def keep(conf):
 
 
 def prune_invalid_configs(configs, named_args, **kwargs):
-    N_CTX = kwargs["N_CTX"]
+    N_CTX_Q = kwargs["N_CTX_Q"]
     STAGE = kwargs["STAGE"]
     return [
-        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
+        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX_Q and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
     ]
 
@@ -387,11 +397,11 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 
 
 @triton.autotune(configs=list(filter(keep, configs)),
-                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"],
+                 key=["N_CTX_Q", "N_CTX_K", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,
+              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX_Q, N_CTX_K,
               HEAD_DIM: tl.constexpr,
               BLOCK_M: tl.constexpr,
               BLOCK_N: tl.constexpr,
@@ -408,22 +418,24 @@ def _attn_fwd(sm_scale, M,
     off_z = off_hz // H
     off_h = off_hz % H
 
-    y_dim = Z * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    # Q and O share N_CTX_Q rows; K and V share N_CTX_K rows (may differ for asymmetric calls)
+    y_dim_q = Z * H * N_CTX_Q
+    y_dim_k = Z * H * N_CTX_K
+    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
     if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim_k], strides=[N_CTX_K, 1],
                                          block_shape=[HEAD_DIM, BLOCK_N])
     else:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim_k, HEAD_DIM], strides=[HEAD_DIM, 1],
                                          block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim_k, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+    offset_kv = off_z * (N_CTX_K * H) + off_h * N_CTX_K   # base row in K/V descriptor
+    qo_offset_y = off_z * (N_CTX_Q * H) + off_h * N_CTX_Q + start_m * BLOCK_M  # Q tile row
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -435,21 +447,21 @@ def _attn_fwd(sm_scale, M,
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,
                                         desc_k, desc_v,
-                                        offset_y, dtype, start_m, qk_scale,
+                                        offset_kv, dtype, start_m, qk_scale,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
-                                        4 - STAGE, offs_m, offs_n, N_CTX,
+                                        4 - STAGE, offs_m, offs_n, N_CTX_K,
                                         warp_specialize, IS_HOPPER)
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,
                                         desc_k, desc_v,
-                                        offset_y, dtype, start_m, qk_scale,
+                                        offset_kv, dtype, start_m, qk_scale,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
-                                        2, offs_m, offs_n, N_CTX,
+                                        2, offs_m, offs_n, N_CTX_K,
                                         warp_specialize, IS_HOPPER)
     # epilogue — store M (LSE) for backward and for ring attention
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
+    m_ptrs = M + off_hz * N_CTX_Q + offs_m
     tl.store(m_ptrs, m_i)
     desc_o.store([qo_offset_y, 0], acc.to(dtype))
 
@@ -729,7 +741,7 @@ def _attn_bwd_single_pass(
     Q, K, V, sm_scale,
     DO, DQ, DK, DV,
     M, D,
-    stride_z, stride_h, stride_tok, stride_d,
+    stride_z_q, stride_h_q, stride_z_k, stride_h_k, stride_tok, stride_d,
     H, N_CTX_Q, N_CTX_K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -741,16 +753,18 @@ def _attn_bwd_single_pass(
     off_z = off_hz // H
     off_h = off_hz % H
 
-    adj = (stride_h * off_h + stride_z * off_z).to(tl.int64)
+    # Q/DO/DQ use Q strides; K/V/DK/DV use K strides (differ when N_CTX_Q != N_CTX_K)
+    adj_q  = (stride_h_q * off_h + stride_z_q * off_z).to(tl.int64)
+    adj_kv = (stride_h_k * off_h + stride_z_k * off_z).to(tl.int64)
     off_chz_q = (off_hz * N_CTX_Q).to(tl.int64)
 
-    Q  += adj
-    K  += adj
-    V  += adj
-    DO += adj
-    DQ += adj
-    DK += adj
-    DV += adj
+    Q  += adj_q
+    DO += adj_q
+    DQ += adj_q
+    K  += adj_kv
+    V  += adj_kv
+    DK += adj_kv
+    DV += adj_kv
     M  += off_chz_q
     D  += off_chz_q
 
@@ -1069,21 +1083,25 @@ class _attention(torch.autograd.Function):
             waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
-        # M holds the LSE values — shape (batch, heads, seqlen)
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        N_CTX_Q = q.shape[2]
+        N_CTX_K = k.shape[2]
+        # M holds the LSE values — shape (batch, heads, seqlen_q)
+        M = torch.empty((q.shape[0], q.shape[1], N_CTX_Q), device=q.device, dtype=torch.float32)
 
         if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            # Q and O use N_CTX_Q rows; K and V use N_CTX_K rows (may differ for asymmetric calls)
+            y_dim_q = q.shape[0] * q.shape[1] * N_CTX_Q
+            y_dim_k = q.shape[0] * q.shape[1] * N_CTX_K
             dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_q = TensorDescriptor(q, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
+                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim_k], strides=[N_CTX_K, 1],
                                           block_shape=dummy_block)
             else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                desc_v = TensorDescriptor(v, shape=[y_dim_k, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
                                           block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[y_dim_k, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_o = TensorDescriptor(o, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         else:
             desc_q = q
             desc_v = v
@@ -1096,7 +1114,7 @@ class _attention(torch.autograd.Function):
         triton.set_allocator(alloc_fn)
 
         def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+            return (triton.cdiv(N_CTX_Q, META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
         if is_blackwell() and warp_specialize:
@@ -1108,7 +1126,7 @@ class _attention(torch.autograd.Function):
             sm_scale, M,
             q.shape[0], q.shape[1],
             desc_q, desc_k, desc_v, desc_o,
-            N_CTX=q.shape[2],
+            N_CTX_Q=N_CTX_Q, N_CTX_K=N_CTX_K,
             HEAD_DIM=HEAD_DIM_K,
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,
             USE_BF16=q.dtype == torch.bfloat16,
@@ -1134,26 +1152,32 @@ class _attention(torch.autograd.Function):
         v = v.contiguous()
         o = o.contiguous()
         assert do.is_contiguous()
-        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+        # q/do/o must share strides (same seqlen); k/v must share strides with each other
+        # but may differ from q when seqlens differ (asymmetric cross-attention)
+        assert q.stride() == o.stride() == do.stride()
+        assert k.stride() == v.stride()
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        BATCH, N_HEAD, N_CTX_Q = q.shape[:3]
+        N_CTX_K = k.shape[2]
         PRE_BLOCK = 128
         RCP_LN2 = 1.4426950408889634
         arg_k = k
         arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-        assert N_CTX % PRE_BLOCK == 0
-        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        assert N_CTX_Q % PRE_BLOCK == 0
+        pre_grid = (N_CTX_Q // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
 
         _attn_bwd_preprocess[pre_grid](
             o, do,
             delta,
-            BATCH, N_HEAD, N_CTX,
+            BATCH, N_HEAD, N_CTX_Q,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
         )
 
-        if _BWD_KERNEL == "single_pass":
+        # single_pass handles asymmetric seqlens; two_phase requires symmetric.
+        _use_single_pass = _BWD_KERNEL == "single_pass" or N_CTX_Q != N_CTX_K
+        if _use_single_pass:
             # fp32 buffer — accumulated over N_CTX_K/BLOCK_N outer iterations;
             # LN2 scaling applied in Python after the kernel to match two-phase math.
             dq = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
@@ -1162,8 +1186,8 @@ class _attention(torch.autograd.Function):
                 q, arg_k, v, ctx.sm_scale,
                 do, dq, dk, dv,
                 M, delta,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                N_HEAD, N_CTX, N_CTX,
+                q.stride(0), q.stride(1), k.stride(0), k.stride(1), q.stride(2), q.stride(3),
+                N_HEAD, N_CTX_Q, N_CTX_K,
                 HEAD_DIM=ctx.HEAD_DIM,
                 MATMUL_BF16=q.dtype == torch.bfloat16,
                 CAUSAL=ctx.causal,
@@ -1173,12 +1197,12 @@ class _attention(torch.autograd.Function):
         else:
             dq = torch.empty_like(q)
             _load_bwd_autotune_cache()
-            bwd_grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_N1']), 1, BATCH * N_HEAD)
+            bwd_grid = lambda META: (triton.cdiv(N_CTX_Q, META['BLOCK_N1']), 1, BATCH * N_HEAD)
             _attn_bwd[bwd_grid](
                 q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
                 M, delta,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                N_HEAD, N_CTX,
+                N_HEAD, N_CTX_Q,
                 BLK_SLICE_FACTOR=2,
                 HEAD_DIM=ctx.HEAD_DIM,
                 MATMUL_BF16=q.dtype == torch.bfloat16,
