@@ -568,6 +568,18 @@ bwd_configs = [
     for w in [4, 8, 16]
 ]
 
+# Single-pass backward: one tile size pair (Q tile × KV tile), no M1/N1/M2/N2 split.
+bwd_sp_configs = [
+    triton.Config(
+        {'BLOCK_M': BM, 'BLOCK_N': BN},
+        num_stages=s, num_warps=w,
+    )
+    for BM in [32, 64, 128]
+    for BN in [32, 64, 128]
+    for s in [1, 2, 3]
+    for w in [4, 8, 16]
+]
+
 
 @triton.autotune(configs=bwd_configs, key=['N_CTX', 'HEAD_DIM', 'MATMUL_BF16', 'CAUSAL'])
 @triton.jit
@@ -689,6 +701,105 @@ def _attn_bwd(Q, K, V, sm_scale,
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel — single-pass backward (FA SEQUENCE_PARALLEL=False style)
+#
+# Grid: (BATCH * N_HEAD,) — one program per batch×head; seqlen not in grid.
+# Outer loop: KV tiles. Inner loop: Q tiles.
+# dK/dV accumulate in registers, stored once per KV tile — no HBM re-reads.
+# dQ uses load-add-store with evict_last — no atomics (single writer per tile).
+# Supports asymmetric seqlens (N_CTX_Q ≠ N_CTX_K) for ringX3 out of the box.
+# LN2 scaling for dQ is applied in Python after the kernel returns.
+# ---------------------------------------------------------------------------
+
+@triton.autotune(configs=bwd_sp_configs,
+                 key=['N_CTX_Q', 'N_CTX_K', 'HEAD_DIM', 'MATMUL_BF16', 'CAUSAL'])
+@triton.jit
+def _attn_bwd_single_pass(
+    Q, K, V, sm_scale,
+    DO, DQ, DK, DV,
+    M, D,
+    stride_z, stride_h, stride_tok, stride_d,
+    H, N_CTX_Q, N_CTX_K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MATMUL_BF16: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    off_hz = tl.program_id(0)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    adj = (stride_h * off_h + stride_z * off_z).to(tl.int64)
+    off_chz_q = (off_hz * N_CTX_Q).to(tl.int64)
+
+    Q  += adj
+    K  += adj
+    V  += adj
+    DO += adj
+    DQ += adj
+    DK += adj
+    DV += adj
+    M  += off_chz_q
+    D  += off_chz_q
+
+    offs_k = tl.arange(0, HEAD_DIM)
+    matmul_dtype = tl.bfloat16 if MATMUL_BF16 else tl.float16
+
+    # Outer loop: all KV tiles handled by this single program
+    for start_n in range(0, N_CTX_K, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+        # K is pre-scaled by sm_scale * RCP_LN2 at the Python call site
+        k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+
+        # Inner loop: Q tiles — for causal, skip Q tiles entirely before this KV block
+        q_lo = start_n if CAUSAL else 0
+        for start_m in range(q_lo, N_CTX_Q, BLOCK_M):
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+
+            q  = tl.load(Q  + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+            do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+            m  = tl.load(M  + offs_m)
+            Di = tl.load(D  + offs_m)
+
+            # QK^T in base-2 scaled space; K already pre-scaled by sm_scale * log2(e)
+            qk = tl.dot(q, tl.trans(k))            # [BLOCK_M, BLOCK_N]
+            p  = tl.math.exp2(qk - m[:, None])     # [BLOCK_M, BLOCK_N]
+
+            # Causal mask applies only to the diagonal region of the outer loop
+            if CAUSAL:
+                if start_m < start_n + BLOCK_N:
+                    causal_mask = offs_m[:, None] >= offs_n[None, :]
+                    p = tl.where(causal_mask, p, 0.0)
+
+            # dV += p^T @ do
+            dv += tl.dot(tl.trans(p).to(matmul_dtype), do.to(matmul_dtype))
+
+            # dp = do @ V^T;  ds = p * (dp - delta)
+            dp = tl.dot(do.to(matmul_dtype), tl.trans(v)).to(tl.float32)
+            ds = (p * (dp - Di[:, None])).to(matmul_dtype)
+
+            # dK += ds^T @ q
+            dk += tl.dot(tl.trans(ds), q.to(matmul_dtype))
+
+            # dQ[q_tile]: load-add-store — no atomic needed (one program owns this tile)
+            dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+            dq_curr = tl.load(dq_ptrs, eviction_policy="evict_last")
+            dq_curr = dq_curr + tl.dot(ds, k.to(matmul_dtype))
+            tl.store(dq_ptrs, dq_curr, eviction_policy="evict_last")
+
+        # Store dK, dV for this KV tile (accumulated over all Q tiles)
+        dk *= sm_scale
+        tl.store(DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, dk)
+        tl.store(DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, dv)
 
 
 # ---------------------------------------------------------------------------
@@ -819,10 +930,121 @@ def _load_bwd_autotune_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Single-pass backward autotuner cache persistence
+# Uses a separate file (attn_bwd_sp_autotune.json) in the same cache dir so
+# two-phase and single-pass caches never collide even if TRITON_AUTOTUNE_CACHE_DIR
+# is accidentally shared between the two kernel variants.
+# ---------------------------------------------------------------------------
+
+_SP_BWD_CACHE_FILE = (
+    os.path.join(_BWD_CACHE_DIR, "attn_bwd_sp_autotune.json")
+    if _BWD_CACHE_DIR else None
+)
+_sp_bwd_saved_keys: set = set()
+_sp_bwd_cache_loaded: bool = False
+
+
+def _save_sp_bwd_autotune_cache() -> None:
+    if _SP_BWD_CACHE_FILE is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    new_keys = set(_attn_bwd_single_pass.cache.keys()) - _sp_bwd_saved_keys
+    if not new_keys:
+        return
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+
+    timings = getattr(_attn_bwd_single_pass, "configs_timings", {})
+
+    cache_data = {}
+    for key, cfg in _attn_bwd_single_pass.cache.items():
+        t = timings.get(cfg)
+        cache_data[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "time_ms": t[0] if t is not None else None,
+        }
+    tmp = _SP_BWD_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache_data, f, indent=2)
+    os.replace(tmp, _SP_BWD_CACHE_FILE)
+
+    ranking_file = _SP_BWD_CACHE_FILE.replace(".json", "_ranking.json")
+    try:
+        existing = {}
+        if os.path.exists(ranking_file):
+            with open(ranking_file) as f:
+                existing = json.load(f)
+        sorted_cfgs = sorted(
+            timings.keys(),
+            key=lambda c: timings[c][0] if timings.get(c) is not None else float("inf"),
+        ) if timings else _attn_bwd_single_pass.configs
+        for key in new_keys:
+            existing[json.dumps(list(key))] = [
+                {
+                    "rank": i + 1,
+                    "time_ms_median": timings[c][0] if timings.get(c) is not None else None,
+                    "time_ms_p20":    timings[c][1] if timings.get(c) is not None else None,
+                    "time_ms_p80":    timings[c][2] if timings.get(c) is not None else None,
+                    "kwargs": c.kwargs,
+                    "num_warps": c.num_warps,
+                    "num_stages": c.num_stages,
+                }
+                for i, c in enumerate(sorted_cfgs)
+            ]
+        tmp = ranking_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, ranking_file)
+    except Exception:
+        pass
+
+    _sp_bwd_saved_keys.update(new_keys)
+
+
+def _load_sp_bwd_autotune_cache() -> None:
+    global _sp_bwd_cache_loaded
+    if _sp_bwd_cache_loaded:
+        return
+    _sp_bwd_cache_loaded = True
+
+    if _SP_BWD_CACHE_FILE is None:
+        return
+
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 and os.path.exists(_SP_BWD_CACHE_FILE):
+            with open(_SP_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        if os.path.exists(_SP_BWD_CACHE_FILE):
+            with open(_SP_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_bwd_single_pass.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+        )
+    _sp_bwd_saved_keys.update(_attn_bwd_single_pass.cache.keys())
+
+
+# ---------------------------------------------------------------------------
 # Python autograd wrapper
 # KEY CHANGE: forward() now returns (o, M) so LSE is available to callers
 # (e.g. ring attention algorithms that need it for the reduce step)
 # ---------------------------------------------------------------------------
+
+# Selects which backward kernel to use.  Default is the existing two-phase
+# kernel so all existing runs are unaffected until explicitly opted in.
+_BWD_KERNEL = os.environ.get("RINGX_ATTN_BWD_KERNEL", "two_phase")
+
 
 class _attention(torch.autograd.Function):
 
@@ -905,7 +1127,6 @@ class _attention(torch.autograd.Function):
         o = o.contiguous()
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-        dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
@@ -924,19 +1145,38 @@ class _attention(torch.autograd.Function):
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
         )
 
-        _load_bwd_autotune_cache()
-        bwd_grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_N1']), 1, BATCH * N_HEAD)
-        _attn_bwd[bwd_grid](
-            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
-            M, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            N_HEAD, N_CTX,
-            BLK_SLICE_FACTOR=2,
-            HEAD_DIM=ctx.HEAD_DIM,
-            MATMUL_BF16=q.dtype == torch.bfloat16,
-            CAUSAL=ctx.causal,
-        )
-        _save_bwd_autotune_cache()
+        if _BWD_KERNEL == "single_pass":
+            # fp32 buffer — accumulated over N_CTX_K/BLOCK_N outer iterations;
+            # LN2 scaling applied in Python after the kernel to match two-phase math.
+            dq = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
+            _load_sp_bwd_autotune_cache()
+            _attn_bwd_single_pass[(BATCH * N_HEAD,)](
+                q, arg_k, v, ctx.sm_scale,
+                do, dq, dk, dv,
+                M, delta,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                N_HEAD, N_CTX, N_CTX,
+                HEAD_DIM=ctx.HEAD_DIM,
+                MATMUL_BF16=q.dtype == torch.bfloat16,
+                CAUSAL=ctx.causal,
+            )
+            _save_sp_bwd_autotune_cache()
+            dq = dq.mul(0.6931471824645996).to(q.dtype)
+        else:
+            dq = torch.empty_like(q)
+            _load_bwd_autotune_cache()
+            bwd_grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_N1']), 1, BATCH * N_HEAD)
+            _attn_bwd[bwd_grid](
+                q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
+                M, delta,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                N_HEAD, N_CTX,
+                BLK_SLICE_FACTOR=2,
+                HEAD_DIM=ctx.HEAD_DIM,
+                MATMUL_BF16=q.dtype == torch.bfloat16,
+                CAUSAL=ctx.causal,
+            )
+            _save_bwd_autotune_cache()
 
         return dq, dk, dv, None, None, None
 
