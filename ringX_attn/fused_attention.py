@@ -569,10 +569,18 @@ bwd_configs = [
 ]
 
 # Single-pass backward: one tile size pair (Q tile × KV tile), no M1/N1/M2/N2 split.
+#
+# The pre_hook zeros DQ before every kernel invocation (autotune trial or cached run).
+# This is required because the kernel uses load-add-store for DQ: without zeroing,
+# autotune trials accumulate on each other's results and produce wildly wrong gradients.
+def _bwd_sp_zero_dq_hook(nargs):
+    nargs["DQ"].zero_()
+
 bwd_sp_configs = [
     triton.Config(
         {'BLOCK_M': BM, 'BLOCK_N': BN},
         num_stages=s, num_warps=w,
+        pre_hook=_bwd_sp_zero_dq_hook,
     )
     for BM in [32, 64, 128]
     for BN in [32, 64, 128]
