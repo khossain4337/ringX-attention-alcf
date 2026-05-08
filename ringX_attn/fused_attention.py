@@ -1235,6 +1235,88 @@ def _load_ta_bwd_autotune_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Forward autotuner cache persistence
+# Uses attn_fwd_autotune.json in TRITON_AUTOTUNE_CACHE_DIR — separate from all
+# backward caches so the two never collide.
+# Loaded lazily on the first forward pass so torch.distributed is available.
+# Rank-0 reads + broadcast; atomic write via temp+os.replace.
+# Reloaded configs carry pre_hook=_host_descriptor_pre_hook (no-op on XPU;
+# required on Hopper to configure TensorDescriptor block shapes before launch).
+# ---------------------------------------------------------------------------
+
+_FWD_CACHE_FILE = (
+    os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune.json")
+    if _BWD_CACHE_DIR else None
+)
+_fwd_saved_keys: set = set()
+_fwd_cache_loaded: bool = False
+
+
+def _save_fwd_autotune_cache() -> None:
+    if _FWD_CACHE_FILE is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    new_keys = set(_attn_fwd.cache.keys()) - _fwd_saved_keys
+    if not new_keys:
+        return
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+    timings = getattr(_attn_fwd, "configs_timings", {})
+    cache_data = {}
+    for key, cfg in _attn_fwd.cache.items():
+        t = timings.get(cfg)
+        cache_data[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "time_ms": t[0] if t is not None else None,
+        }
+    tmp = _FWD_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache_data, f, indent=2)
+    os.replace(tmp, _FWD_CACHE_FILE)
+    _fwd_saved_keys.update(new_keys)
+
+
+def _load_fwd_autotune_cache() -> None:
+    """Load saved forward autotune configs into _attn_fwd.cache.
+
+    Called lazily on the first forward pass so that torch.distributed is
+    already initialized. Rank 0 reads the file; the result is broadcast to
+    all other ranks so only one process hits Lustre.
+    """
+    global _fwd_cache_loaded
+    if _fwd_cache_loaded:
+        return
+    _fwd_cache_loaded = True
+    if _FWD_CACHE_FILE is None:
+        return
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 and os.path.exists(_FWD_CACHE_FILE):
+            with open(_FWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        if os.path.exists(_FWD_CACHE_FILE):
+            with open(_FWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_fwd.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+            pre_hook=_host_descriptor_pre_hook,
+        )
+    # Mark loaded keys as already-saved so _save_fwd_autotune_cache does not
+    # overwrite them with time_ms=null on cache-hit runs (no fresh timing).
+    _fwd_saved_keys.update(_attn_fwd.cache.keys())
+
+
+# ---------------------------------------------------------------------------
 # Python autograd wrapper
 # KEY CHANGE: forward() now returns (o, M) so LSE is available to callers
 # (e.g. ring attention algorithms that need it for the reduce step)
@@ -1299,6 +1381,7 @@ class _attention(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 168
             else:
                 extra_kern_args["maxnreg"] = 80
+        _load_fwd_autotune_cache()
         _attn_fwd[grid](
             sm_scale, M,
             q.shape[0], q.shape[1],
@@ -1311,6 +1394,7 @@ class _attention(torch.autograd.Function):
             warp_specialize=warp_specialize,
             IS_HOPPER=is_hopper(),
             **extra_kern_args)
+        _save_fwd_autotune_cache()
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
