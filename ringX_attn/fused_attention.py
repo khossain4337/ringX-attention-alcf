@@ -1284,6 +1284,11 @@ def _save_fwd_autotune_cache() -> None:
     if not new_keys:
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    # Only ranks 0 and 1 save: together they cover all 3 unique ringX3 forward
+    # shapes at any world_size (rank 1 sees all three; rank 0 covers world_size=1).
+    if rank > 1:
+        _fwd_saved_keys.update(new_keys)
+        return
     cache_file = _fwd_cache_file(rank)
     os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
     timings = getattr(_attn_fwd, "configs_timings", {})
