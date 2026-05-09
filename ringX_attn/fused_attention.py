@@ -364,7 +364,7 @@ configs = [
     for BM in [64, 128]
     for BN in [32, 64, 128]
     for s in NUM_STAGES_OPTIONS
-    for w in [4, 8]
+    for w in [4, 8, 16]
 ]
 
 
@@ -397,8 +397,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 
 
 @triton.autotune(configs=list(filter(keep, configs)),
-                 key=["N_CTX_Q", "N_CTX_K", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+                 key=["N_CTX_Q", "N_CTX_K", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"])
 @triton.jit
 def _attn_fwd(sm_scale, M,
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX_Q, N_CTX_K,
@@ -1236,71 +1235,106 @@ def _load_ta_bwd_autotune_cache() -> None:
 
 # ---------------------------------------------------------------------------
 # Forward autotuner cache persistence
-# Uses attn_fwd_autotune.json in TRITON_AUTOTUNE_CACHE_DIR — separate from all
-# backward caches so the two never collide.
-# Loaded lazily on the first forward pass so torch.distributed is available.
-# Rank-0 reads + broadcast; atomic write via temp+os.replace.
+# Each rank saves to its own file: attn_fwd_autotune_rank{r}.json.
+# This is necessary because different ranks see different (N_CTX_Q, N_CTX_K)
+# shapes (e.g. in ringX3, rank 0 never makes (2048,1024) forward calls so a
+# rank-0-only save would permanently miss that shape).
+# On load, rank 0 merges all per-rank files + the legacy single file, then
+# broadcasts the merged result. No cross-rank synchronization needed during save.
 # Reloaded configs carry pre_hook=_host_descriptor_pre_hook (no-op on XPU;
 # required on Hopper to configure TensorDescriptor block shapes before launch).
 # ---------------------------------------------------------------------------
 
-_FWD_CACHE_FILE = (
-    os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune.json")
-    if _BWD_CACHE_DIR else None
-)
 _fwd_saved_keys: set = set()
 _fwd_cache_loaded: bool = False
 
 
+def _fwd_cache_file(rank: int) -> Optional[str]:
+    if _BWD_CACHE_DIR is None:
+        return None
+    return os.path.join(_BWD_CACHE_DIR, f"attn_fwd_autotune_rank{rank}.json")
+
+
+def _merge_fwd_cache_files() -> dict:
+    """Return merged dict from all per-rank fwd cache files + legacy single file."""
+    import glob
+    merged: dict = {}
+    # Legacy single file (produced before per-rank fix) — read for backward compat.
+    legacy = os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune.json")
+    if os.path.exists(legacy):
+        try:
+            with open(legacy) as f:
+                merged.update(json.load(f))
+        except Exception:
+            pass
+    for path in sorted(glob.glob(
+            os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune_rank*.json"))):
+        try:
+            with open(path) as f:
+                merged.update(json.load(f))
+        except Exception:
+            pass
+    return merged
+
+
 def _save_fwd_autotune_cache() -> None:
-    if _FWD_CACHE_FILE is None:
-        return
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+    if _BWD_CACHE_DIR is None:
         return
     new_keys = set(_attn_fwd.cache.keys()) - _fwd_saved_keys
     if not new_keys:
         return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    cache_file = _fwd_cache_file(rank)
     os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
     timings = getattr(_attn_fwd, "configs_timings", {})
-    cache_data = {}
-    for key, cfg in _attn_fwd.cache.items():
+    # Read this rank's own existing file to preserve previously saved entries.
+    existing: dict = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file) as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+    for key in new_keys:
+        cfg = _attn_fwd.cache[key]
         t = timings.get(cfg)
-        cache_data[json.dumps(list(key))] = {
+        existing[json.dumps(list(key))] = {
             "kwargs": cfg.kwargs,
             "num_warps": cfg.num_warps,
             "num_stages": cfg.num_stages,
             "time_ms": t[0] if t is not None else None,
         }
-    tmp = _FWD_CACHE_FILE + ".tmp"
+    tmp = cache_file + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(cache_data, f, indent=2)
-    os.replace(tmp, _FWD_CACHE_FILE)
+        json.dump(existing, f, indent=2)
+    os.replace(tmp, cache_file)
     _fwd_saved_keys.update(new_keys)
 
 
 def _load_fwd_autotune_cache() -> None:
-    """Load saved forward autotune configs into _attn_fwd.cache.
+    """Load forward autotune configs (all ranks' files merged) into _attn_fwd.cache.
 
-    Called lazily on the first forward pass so that torch.distributed is
-    already initialized. Rank 0 reads the file; the result is broadcast to
-    all other ranks so only one process hits Lustre.
+    Called lazily on the first forward pass so torch.distributed is already
+    initialized. Rank 0 merges all per-rank files; result is broadcast so only
+    one process hits Lustre.
     """
     global _fwd_cache_loaded
     if _fwd_cache_loaded:
         return
     _fwd_cache_loaded = True
-    if _FWD_CACHE_FILE is None:
+    if _BWD_CACHE_DIR is None:
         return
     cache_data = [None]
     if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0 and os.path.exists(_FWD_CACHE_FILE):
-            with open(_FWD_CACHE_FILE) as f:
-                cache_data[0] = json.load(f)
+        if torch.distributed.get_rank() == 0:
+            merged = _merge_fwd_cache_files()
+            if merged:
+                cache_data[0] = merged
         torch.distributed.broadcast_object_list(cache_data, src=0)
     else:
-        if os.path.exists(_FWD_CACHE_FILE):
-            with open(_FWD_CACHE_FILE) as f:
-                cache_data[0] = json.load(f)
+        merged = _merge_fwd_cache_files()
+        if merged:
+            cache_data[0] = merged
     if cache_data[0] is None:
         return
     for str_key, cfg_dict in cache_data[0].items():
@@ -1312,7 +1346,7 @@ def _load_fwd_autotune_cache() -> None:
             pre_hook=_host_descriptor_pre_hook,
         )
     # Mark loaded keys as already-saved so _save_fwd_autotune_cache does not
-    # overwrite them with time_ms=null on cache-hit runs (no fresh timing).
+    # re-save them with time_ms=null on cache-hit runs (no fresh timing).
     _fwd_saved_keys.update(_attn_fwd.cache.keys())
 
 
