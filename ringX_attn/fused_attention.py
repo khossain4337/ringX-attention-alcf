@@ -1256,22 +1256,32 @@ def _fwd_cache_file(rank: int) -> Optional[str]:
 
 
 def _merge_fwd_cache_files() -> dict:
-    """Return merged dict from all per-rank fwd cache files + legacy single file."""
+    """Return merged dict from all per-rank fwd cache files + legacy single file.
+
+    When the same key appears in multiple files, keep the entry with lower time_ms
+    (run-to-run variance can flip the winner between ranks; take the faster one).
+    """
     import glob
+
+    def _merge_one(merged: dict, data: dict) -> None:
+        for key, val in data.items():
+            if key not in merged or val.get("time_ms", float("inf")) < merged[key].get("time_ms", float("inf")):
+                merged[key] = val
+
     merged: dict = {}
     # Legacy single file (produced before per-rank fix) — read for backward compat.
     legacy = os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune.json")
     if os.path.exists(legacy):
         try:
             with open(legacy) as f:
-                merged.update(json.load(f))
+                _merge_one(merged, json.load(f))
         except Exception:
             pass
     for path in sorted(glob.glob(
             os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune_rank*.json"))):
         try:
             with open(path) as f:
-                merged.update(json.load(f))
+                _merge_one(merged, json.load(f))
         except Exception:
             pass
     return merged
