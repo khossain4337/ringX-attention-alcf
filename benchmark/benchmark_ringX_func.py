@@ -550,6 +550,7 @@ if __name__ == "__main__":
         default=os.environ.get("BENCHMARK_DTYPE", "bfloat16"),
         help="Tensor dtype to benchmark.",
     )
+    parser.add_argument("--num_warmup", type=int, default=1, help="Number of warmup iterations before timed region.")
     parser.add_argument("--profile", action="store_true", help="Enable profiling.")
     _dist_backend = "xccl" if _DEVICE_TYPE == "xpu" else "nccl"
     dist.init_process_group(_dist_backend, timeout=timedelta(seconds=36000))
@@ -592,6 +593,7 @@ if __name__ == "__main__":
                         func,
                         mode=mode,
                         num_iter=num_iter,
+                        warmup_iter=args.num_warmup,
                         log=True,
                         profile=profile,
                     )
