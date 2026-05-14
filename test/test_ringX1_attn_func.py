@@ -1,3 +1,5 @@
+# NOTE: This test uses flash_attn as the correctness reference and hardcodes the nccl/cuda backend.
+# XPU (Aurora / Intel GPU Max) support for this test is not yet implemented.
 import torch
 import torch.distributed as dist
 from flash_attn import flash_attn_func
