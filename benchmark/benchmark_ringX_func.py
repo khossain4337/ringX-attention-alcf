@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import traceback
 from datetime import timedelta
 
@@ -9,6 +10,41 @@ import torch
 import torch.distributed as dist
 
 from ringX_attn import backend as ringx_backend
+
+_DEVICE_TYPE = os.environ.get("DEVICE_TYPE", "cuda")
+
+
+def _make_event():
+    if _DEVICE_TYPE == "xpu":
+        return torch.xpu.Event(enable_timing=True)
+    return torch.cuda.Event(enable_timing=True)
+
+
+def _synchronize(device=None):
+    if _DEVICE_TYPE == "xpu":
+        torch.xpu.synchronize(device=device)
+    else:
+        torch.cuda.synchronize(device=device)
+
+
+def _start_timer(device):
+    if _DEVICE_TYPE == "xpu":
+        _synchronize(device=device)
+        return ("wall", time.perf_counter())
+    e = _make_event()
+    e.record()
+    return ("event", e)
+
+
+def _stop_timer_sec(start, device):
+    kind, val = start
+    if kind == "wall":
+        _synchronize(device=device)
+        return time.perf_counter() - val
+    end = _make_event()
+    end.record()
+    _synchronize(device=device)
+    return val.elapsed_time(end) / 1000.0
 
 try:
     from ring_flash_attn import (
@@ -44,7 +80,6 @@ def _current_backend_name(func):
 
 
 _FUSED_BENCHMARK_UNSUPPORTED_ALGOS = {
-    "ringX3_attn": "ringX3_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
     "ringX4_attn": "ringX4_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
     "ringX4o_attn": "ringX4o_attn slices q and kv into unequal local sequence blocks, which the fused backend does not support.",
 }
@@ -213,52 +248,39 @@ def _warmup(mode, func, q, k, v, dout, *, warmup_iter, causal, deterministic):
 
 
 def _measure_forward(func, q, k, v, *, num_iter, causal, deterministic, profile=False, profiler=None):
-    begin = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    begin.record()
+    t = _start_timer(q.device)
     with torch.no_grad():
         for _ in range(num_iter):
             _ = _run_forward(func, q, k, v, causal, deterministic)
             if profile and profiler is not None:
                 profiler.step()
-    end.record()
-    torch.cuda.synchronize(device=q.device)
-    return begin.elapsed_time(end) / 1000.0
+    return _stop_timer_sec(t, q.device)
 
 
 
 def _measure_forward_backward(func, q, k, v, dout, *, num_iter, causal, deterministic, profile=False, profiler=None):
-    begin = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    begin.record()
+    t = _start_timer(q.device)
     for _ in range(num_iter):
         _zero_grads(q, k, v)
         out = _run_forward(func, q, k, v, causal, deterministic)
         out.backward(dout)
         if profile and profiler is not None:
             profiler.step()
-    end.record()
-    torch.cuda.synchronize(device=q.device)
-    return begin.elapsed_time(end) / 1000.0
+    return _stop_timer_sec(t, q.device)
 
 
 
 def _measure_backward(func, q, k, v, dout, *, num_iter, causal, deterministic, profile=False, profiler=None):
-    total_ms = 0.0
+    total_sec = 0.0
     for _ in range(num_iter):
         _zero_grads(q, k, v)
         out = _run_forward(func, q, k, v, causal, deterministic)
-        torch.cuda.synchronize(device=q.device)
-        begin = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        begin.record()
+        t = _start_timer(q.device)
         out.backward(dout)
-        end.record()
-        torch.cuda.synchronize(device=q.device)
-        total_ms += begin.elapsed_time(end)
+        total_sec += _stop_timer_sec(t, q.device)
         if profile and profiler is not None:
             profiler.step()
-    return total_ms / 1000.0
+    return total_sec
 
 
 
@@ -267,8 +289,11 @@ def benchmark(args, func, warmup_iter=1, num_iter=100, mode="forward", log=True,
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
+    device = torch.device(f"{_DEVICE_TYPE}:{local_rank}")
+    if _DEVICE_TYPE == "xpu":
+        torch.xpu.set_device(device)
+    else:
+        torch.cuda.set_device(device)
 
     batch_size = args.batch_size
     deterministic = False
@@ -461,6 +486,7 @@ def _emit_result(args, func, mode, result):
         "requested_backend": result["requested_backend"],
         "forward_backend": result["forward_backend"],
         "backward_backend": result["backward_backend"],
+        "bwd_kernel": os.environ.get("RINGX_ATTN_BWD_KERNEL", "two_phase"),
         "causal": args.causal,
         "batch": args.batch_size,
         "seqlen": args.seq_length,
@@ -524,8 +550,10 @@ if __name__ == "__main__":
         default=os.environ.get("BENCHMARK_DTYPE", "bfloat16"),
         help="Tensor dtype to benchmark.",
     )
+    parser.add_argument("--num_warmup", type=int, default=1, help="Number of warmup iterations before timed region.")
     parser.add_argument("--profile", action="store_true", help="Enable profiling.")
-    dist.init_process_group("nccl", timeout=timedelta(seconds=36000))
+    _dist_backend = "xccl" if _DEVICE_TYPE == "xpu" else "nccl"
+    dist.init_process_group(_dist_backend, timeout=timedelta(seconds=36000))
     rank = dist.get_rank()
     args = parser.parse_args()
 
@@ -556,7 +584,7 @@ if __name__ == "__main__":
     try:
         for mode in modes:
             for func in impls:
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache() if _DEVICE_TYPE == "xpu" else torch.cuda.empty_cache()
                 if rank == 0:
                     print(f"# {func.__name__} [{mode}]")
                 try:
@@ -565,6 +593,7 @@ if __name__ == "__main__":
                         func,
                         mode=mode,
                         num_iter=num_iter,
+                        warmup_iter=args.num_warmup,
                         log=True,
                         profile=profile,
                     )

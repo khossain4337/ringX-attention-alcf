@@ -47,6 +47,8 @@ set_backend("portable")
 
 Each `ringX*_attn_func(...)` call also accepts `backend=None | "flash_attn" | "fused" | "portable"` for per-call overrides.
 
+For a full pictorial walkthrough of how a call flows from the user API down to the Triton kernel, see [docs/ROUTING_MAP.md](docs/ROUTING_MAP.md).
+
 Current backend limitations:
 
 - `portable`: `dropout_p` must be `0`, and `alibi_slopes` is not supported
@@ -130,6 +132,30 @@ To train a Llama3 8b model with context length up to 1M tokens:
 cd app/gpt/train
 sbatch job.sb xforge/llama3-8b-1m
 ```
+
+## Usage on Aurora (ALCF)
+### Software environment
+- Intel GPU Max 1550 (Ponte Vecchio), 6 GPUs per node / 12 tiles
+- `intel-xpu-backend-for-triton` (installed in the ALCF module stack)
+- PyTorch with XPU support (`torch.xpu`)
+- Process group backend: `xccl` (via oneCCL)
+
+### Benchmark
+```bash
+DEVICE_TYPE=xpu BACKEND=fused \
+TRITON_AUTOTUNE_CACHE_DIR=/lus/flare/projects/.../triton_cache \
+NUM_WARMUP=8 bash script/run_benchmarks.sh
+```
+
+Set `TRITON_AUTOTUNE_CACHE_DIR` to a persistent path (Lustre or home directory) so kernel
+configs are tuned once and reloaded on subsequent jobs. Set `NUM_WARMUP=8` to absorb GPU JIT
+compilation overhead before the timed region begins.
+
+### Notes
+- `flash_attn` is not available on XPU; the `fused` backend (Triton) is the recommended path
+- `portable` backend (pure PyTorch, no Triton required) is always available as a fallback or correctness baseline (`BACKEND=portable`)
+- `test/test_ringX1_attn_func.py` and `test/test_ringX3_attn_func.py` are CUDA-only for now (hardcoded `nccl`/`cuda` backend, `flash_attn` reference); XPU-compatible test files are planned
+- The `fused` backend auto-selects the correct kernel per platform: `two_phase` for symmetric calls on XPU, `two_phase_asym` for asymmetric calls (ringX3 cross-rank), `single_pass` on CUDA
 
 ## Acknowledgement
 This project builds upon several open-source efforts: [ring attention](https://github.com/zhuzilin/ring-flash-attention), [tree attention](https://github.com/Zyphra/tree_attention)

@@ -7,6 +7,7 @@ cd "$REPO_ROOT"
 NPROC="${NPROC:-2}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 NUM_ITER="${NUM_ITER:-10}"
+NUM_WARMUP="${NUM_WARMUP:-1}"
 NUM_HEADS="${NUM_HEADS:-32}"
 HEAD_DIM="${HEAD_DIM:-128}"
 SEQ_LENGTHS_STR="${SEQ_LENGTHS:-4096 8192}"
@@ -15,6 +16,16 @@ DTYPE="${DTYPE:-${BENCHMARK_DTYPE:-bfloat16}}"
 BACKEND="${BACKEND:-${RINGX_ATTN_BACKEND:-}}"
 STOP_ON_ERROR="${STOP_ON_ERROR:-0}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/benchmark_results/$(date +%Y%m%d_%H%M%S)}"
+
+# Aurora / Intel XPU: set these two env vars for reliable benchmark numbers.
+#   TRITON_AUTOTUNE_CACHE_DIR=/path/on/lustre      -- kernel configs are tuned once and
+#                          or ~/triton_cache           reloaded from cache on subsequent jobs
+#   NUM_WARMUP=8                                   -- absorbs GPU JIT compilation overhead
+#                                                     before the timed region begins
+# Example:
+#   DEVICE_TYPE=xpu BACKEND=fused \
+#   TRITON_AUTOTUNE_CACHE_DIR=/lus/flare/projects/.../triton_cache \
+#   NUM_WARMUP=8 bash script/run_benchmarks.sh
 
 if [[ -n "${BENCHMARK_MODES:-}" ]]; then
   BENCHMARK_MODES_STR="$BENCHMARK_MODES"
@@ -139,6 +150,7 @@ for algo in "${ALGOS[@]}"; do
           --impl "$impl"
           --batch_size "$BATCH_SIZE"
           --num_iter "$NUM_ITER"
+          --num_warmup "$NUM_WARMUP"
           --seq_length "$seqlen"
           --num_heads "$NUM_HEADS"
           --head_dim "$HEAD_DIM"

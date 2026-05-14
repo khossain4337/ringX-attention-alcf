@@ -27,6 +27,8 @@ Tensor layout: (batch, heads, seqlen, head_dim)
   NOTE: ringX_attn uses (batch, seqlen, heads, head_dim) — transpose at call site.
 """
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -120,15 +122,25 @@ def _qkv_support_error(
         return "fused backend does not support alibi_slopes."
     if window_size != (-1, -1):
         return "fused backend does not support local window attention."
-    if q.shape[:3] != k.shape[:3] or q.shape[:3] != v.shape[:3]:
-        return "fused backend requires q, k, and v to share the same batch, sequence, and head dimensions."
+    # batch and head count must match; seqlen may differ (asymmetric cross-attention)
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        return "fused backend requires q, k, and v to share the same batch size."
+    if q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2]:
+        return "fused backend requires q, k, and v to share the same number of heads."
+    if k.shape[1] != v.shape[1]:
+        return "fused backend requires k and v to share the same sequence length."
     if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
         return "fused backend requires q, k, and v to share the same head dimension."
     if q.shape[-1] not in SUPPORTED_HEAD_DIMS:
         return f"fused backend requires head_dim in {sorted(SUPPORTED_HEAD_DIMS)}."
     if q.shape[1] % REQUIRED_SEQUENCE_MULTIPLE != 0:
         return (
-            "fused backend currently requires sequence length to be a multiple of "
+            "fused backend currently requires q sequence length to be a multiple of "
+            f"{REQUIRED_SEQUENCE_MULTIPLE}."
+        )
+    if k.shape[1] % REQUIRED_SEQUENCE_MULTIPLE != 0:
+        return (
+            "fused backend currently requires k/v sequence length to be a multiple of "
             f"{REQUIRED_SEQUENCE_MULTIPLE}."
         )
     return None
@@ -352,7 +364,7 @@ configs = [
     for BM in [64, 128]
     for BN in [32, 64, 128]
     for s in NUM_STAGES_OPTIONS
-    for w in [4, 8]
+    for w in [4, 8, 16]
 ]
 
 
@@ -364,10 +376,10 @@ def keep(conf):
 
 
 def prune_invalid_configs(configs, named_args, **kwargs):
-    N_CTX = kwargs["N_CTX"]
+    N_CTX_Q = kwargs["N_CTX_Q"]
     STAGE = kwargs["STAGE"]
     return [
-        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
+        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX_Q and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
     ]
 
@@ -385,11 +397,10 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 
 
 @triton.autotune(configs=list(filter(keep, configs)),
-                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+                 key=["N_CTX_Q", "N_CTX_K", "HEAD_DIM", "FP8_OUTPUT", "USE_BF16", "warp_specialize"])
 @triton.jit
 def _attn_fwd(sm_scale, M,
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,
+              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX_Q, N_CTX_K,
               HEAD_DIM: tl.constexpr,
               BLOCK_M: tl.constexpr,
               BLOCK_N: tl.constexpr,
@@ -406,22 +417,24 @@ def _attn_fwd(sm_scale, M,
     off_z = off_hz // H
     off_h = off_hz % H
 
-    y_dim = Z * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    # Q and O share N_CTX_Q rows; K and V share N_CTX_K rows (may differ for asymmetric calls)
+    y_dim_q = Z * H * N_CTX_Q
+    y_dim_k = Z * H * N_CTX_K
+    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
     if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim_k], strides=[N_CTX_K, 1],
                                          block_shape=[HEAD_DIM, BLOCK_N])
     else:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim_k, HEAD_DIM], strides=[HEAD_DIM, 1],
                                          block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim_k, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim_q, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+    offset_kv = off_z * (N_CTX_K * H) + off_h * N_CTX_K   # base row in K/V descriptor
+    qo_offset_y = off_z * (N_CTX_Q * H) + off_h * N_CTX_Q + start_m * BLOCK_M  # Q tile row
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -433,21 +446,21 @@ def _attn_fwd(sm_scale, M,
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,
                                         desc_k, desc_v,
-                                        offset_y, dtype, start_m, qk_scale,
+                                        offset_kv, dtype, start_m, qk_scale,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
-                                        4 - STAGE, offs_m, offs_n, N_CTX,
+                                        4 - STAGE, offs_m, offs_n, N_CTX_K,
                                         warp_specialize, IS_HOPPER)
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,
                                         desc_k, desc_v,
-                                        offset_y, dtype, start_m, qk_scale,
+                                        offset_kv, dtype, start_m, qk_scale,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
-                                        2, offs_m, offs_n, N_CTX,
+                                        2, offs_m, offs_n, N_CTX_K,
                                         warp_specialize, IS_HOPPER)
     # epilogue — store M (LSE) for backward and for ring attention
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
+    m_ptrs = M + off_hz * N_CTX_Q + offs_m
     tl.store(m_ptrs, m_i)
     desc_o.store([qo_offset_y, 0], acc.to(dtype))
 
@@ -555,6 +568,51 @@ def _attn_bwd_dq(dq, q, K, V,
     return dq
 
 
+bwd_configs = [
+    triton.Config(
+        {'BLOCK_M1': BM1, 'BLOCK_N1': BN1, 'BLOCK_M2': BM2, 'BLOCK_N2': BN2},
+        num_stages=s, num_warps=w,
+    )
+    for (BM1, BN1) in [(32, 128), (64, 128), (128, 128)]
+    for (BM2, BN2) in [(128, 32), (128, 64), (128, 128)]
+    for s in [3, 4, 5]
+    for w in [4, 8, 16]
+]
+
+# Single-pass backward: one tile size pair (Q tile × KV tile), no M1/N1/M2/N2 split.
+#
+# The pre_hook zeros DQ before every kernel invocation (autotune trial or cached run).
+# This is required because the kernel uses load-add-store for DQ: without zeroing,
+# autotune trials accumulate on each other's results and produce wildly wrong gradients.
+def _bwd_sp_zero_dq_hook(nargs):
+    nargs["DQ"].zero_()
+
+bwd_sp_configs = [
+    triton.Config(
+        {'BLOCK_M': BM, 'BLOCK_N': BN},
+        num_stages=s, num_warps=w,
+        pre_hook=_bwd_sp_zero_dq_hook,
+    )
+    for BM in [32, 64, 128]
+    for BN in [32, 64, 128]
+    for s in [1, 2, 3]
+    for w in [4, 8, 16]
+]
+
+
+bwd_ta_configs = [
+    triton.Config(
+        {'BLOCK_M1': BM1, 'BLOCK_N1': BN1, 'BLOCK_M2': BM2, 'BLOCK_N2': BN2},
+        num_stages=s, num_warps=w,
+    )
+    for (BM1, BN1) in [(32, 128), (64, 128), (128, 128)]
+    for (BM2, BN2) in [(128, 32), (128, 64), (128, 128)]
+    for s in [3, 4, 5]
+    for w in [4, 8, 16]
+]
+
+
+@triton.autotune(configs=bwd_configs, key=['N_CTX', 'HEAD_DIM', 'MATMUL_BF16', 'CAUSAL'])
 @triton.jit
 def _attn_bwd(Q, K, V, sm_scale,
               DO,
@@ -677,10 +735,646 @@ def _attn_bwd(Q, K, V, sm_scale,
 
 
 # ---------------------------------------------------------------------------
+# Triton kernel — single-pass backward (FA SEQUENCE_PARALLEL=False style)
+#
+# Grid: (BATCH * N_HEAD,) — one program per batch×head; seqlen not in grid.
+# Outer loop: KV tiles. Inner loop: Q tiles.
+# dK/dV accumulate in registers, stored once per KV tile — no HBM re-reads.
+# dQ uses load-add-store with evict_last — no atomics (single writer per tile).
+# Supports asymmetric seqlens (N_CTX_Q ≠ N_CTX_K) for ringX3 out of the box.
+# LN2 scaling for dQ is applied in Python after the kernel returns.
+# ---------------------------------------------------------------------------
+
+@triton.autotune(configs=bwd_sp_configs,
+                 key=['N_CTX_Q', 'N_CTX_K', 'HEAD_DIM', 'MATMUL_BF16', 'CAUSAL'])
+@triton.jit
+def _attn_bwd_single_pass(
+    Q, K, V, sm_scale,
+    DO, DQ, DK, DV,
+    M, D,
+    stride_z_q, stride_h_q, stride_z_k, stride_h_k, stride_tok, stride_d,
+    H, N_CTX_Q, N_CTX_K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MATMUL_BF16: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    off_hz = tl.program_id(0)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    # Q/DO/DQ use Q strides; K/V/DK/DV use K strides (differ when N_CTX_Q != N_CTX_K)
+    adj_q  = (stride_h_q * off_h + stride_z_q * off_z).to(tl.int64)
+    adj_kv = (stride_h_k * off_h + stride_z_k * off_z).to(tl.int64)
+    off_chz_q = (off_hz * N_CTX_Q).to(tl.int64)
+
+    Q  += adj_q
+    DO += adj_q
+    DQ += adj_q
+    K  += adj_kv
+    V  += adj_kv
+    DK += adj_kv
+    DV += adj_kv
+    M  += off_chz_q
+    D  += off_chz_q
+
+    offs_k = tl.arange(0, HEAD_DIM)
+    matmul_dtype = tl.bfloat16 if MATMUL_BF16 else tl.float16
+
+    # Outer loop: all KV tiles handled by this single program
+    for start_n in range(0, N_CTX_K, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+        dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+        # K is pre-scaled by sm_scale * RCP_LN2 at the Python call site
+        k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+
+        # Inner loop: Q tiles — for causal, skip Q tiles entirely before this KV block
+        q_lo = start_n if CAUSAL else 0
+        for start_m in range(q_lo, N_CTX_Q, BLOCK_M):
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+
+            q  = tl.load(Q  + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+            do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+            m  = tl.load(M  + offs_m)
+            Di = tl.load(D  + offs_m)
+
+            # QK^T in base-2 scaled space; K already pre-scaled by sm_scale * log2(e)
+            qk = tl.dot(q, tl.trans(k))            # [BLOCK_M, BLOCK_N]
+            p  = tl.math.exp2(qk - m[:, None])     # [BLOCK_M, BLOCK_N]
+
+            # Causal mask applies only to the diagonal region of the outer loop
+            if CAUSAL:
+                if start_m < start_n + BLOCK_N:
+                    causal_mask = offs_m[:, None] >= offs_n[None, :]
+                    p = tl.where(causal_mask, p, 0.0)
+
+            # dV += p^T @ do
+            dv += tl.dot(tl.trans(p).to(matmul_dtype), do.to(matmul_dtype))
+
+            # dp = do @ V^T;  ds = p * (dp - delta)
+            dp = tl.dot(do.to(matmul_dtype), tl.trans(v)).to(tl.float32)
+            ds = (p * (dp - Di[:, None])).to(matmul_dtype)
+
+            # dK += ds^T @ q
+            dk += tl.dot(tl.trans(ds), q.to(matmul_dtype))
+
+            # dQ[q_tile]: load-add-store — no atomic needed (one program owns this tile)
+            dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+            dq_curr = tl.load(dq_ptrs, eviction_policy="evict_last")
+            dq_curr = dq_curr + tl.dot(ds, k.to(matmul_dtype))
+            tl.store(dq_ptrs, dq_curr, eviction_policy="evict_last")
+
+        # Store dK, dV for this KV tile (accumulated over all Q tiles)
+        dk *= sm_scale
+        tl.store(DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, dk)
+        tl.store(DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, dv)
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel — two-phase asymmetric backward (XPU path for ringX3)
+#
+# Grid: (max(cdiv(N_CTX_K, BLOCK_N1), cdiv(N_CTX_Q, BLOCK_M2)), 1, B*H)
+# Phase 1 (dK/dV): pid < num_kv_tiles — one program per KV tile, iterates all Q tiles.
+# Phase 2 (dQ):    pid < num_q_tiles  — one program per Q tile, iterates all KV tiles.
+# Programs whose pid exceeds the relevant tile count exit each phase immediately.
+#
+# Always CAUSAL=False — all asymmetric ringX3 cross-rank calls are non-causal.
+# dQ accumulated in registers, written once — no eviction policy needed (XPU-safe).
+# ---------------------------------------------------------------------------
+
+@triton.autotune(configs=bwd_ta_configs, key=['N_CTX_Q', 'N_CTX_K', 'HEAD_DIM', 'MATMUL_BF16'])
+@triton.jit
+def _attn_bwd_two_phase_asym(
+    Q, K, V, sm_scale,
+    DO, DQ, DK, DV,
+    M, D,
+    stride_z_q, stride_h_q, stride_z_k, stride_h_k, stride_tok, stride_d,
+    H, N_CTX_Q, N_CTX_K,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    BLOCK_M2: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MATMUL_BF16: tl.constexpr,
+):
+    LN2: tl.constexpr = 0.6931471824645996
+
+    bhid  = tl.program_id(2)
+    pid   = tl.program_id(0)
+    off_z = bhid // H
+    off_h = bhid % H
+
+    adj_q  = (stride_h_q * off_h + stride_z_q * off_z).to(tl.int64)
+    adj_kv = (stride_h_k * off_h + stride_z_k * off_z).to(tl.int64)
+    off_chz_q = (bhid * N_CTX_Q).to(tl.int64)
+
+    Q  += adj_q
+    DO += adj_q
+    DQ += adj_q
+    K  += adj_kv
+    V  += adj_kv
+    DK += adj_kv
+    DV += adj_kv
+    M  += off_chz_q
+    D  += off_chz_q
+
+    offs_k = tl.arange(0, HEAD_DIM)
+
+    # ── Phase 1: dK / dV ─────────────────────────────────────────────────────
+    num_kv_tiles = tl.cdiv(N_CTX_K, BLOCK_N1)
+    if pid < num_kv_tiles:
+        start_n = pid * BLOCK_N1
+        offs_n  = start_n + tl.arange(0, BLOCK_N1)
+        dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        k  = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        v  = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
+
+        # causal=False: iterate all Q tiles from 0
+        num_steps = N_CTX_Q // BLOCK_M1
+        dk, dv = _attn_bwd_dkdv(
+            dk, dv, Q, k, v, sm_scale, DO, M, D,
+            stride_tok, stride_d, H, N_CTX_Q,
+            BLOCK_M1, BLOCK_N1, HEAD_DIM, MATMUL_BF16,
+            start_n, 0, num_steps, MASK=False,
+        )
+
+        tl.store(DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, dv)
+        dk *= sm_scale
+        tl.store(DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, dk)
+
+    # ── Phase 2: dQ ──────────────────────────────────────────────────────────
+    num_q_tiles = tl.cdiv(N_CTX_Q, BLOCK_M2)
+    if pid < num_q_tiles:
+        start_m = pid * BLOCK_M2
+        offs_m  = start_m + tl.arange(0, BLOCK_M2)
+        q  = tl.load(Q  + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+        do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
+        m  = tl.load(M  + offs_m)
+        m  = m[:, None]
+
+        # causal=False: iterate all KV tiles from 0
+        num_steps = N_CTX_K // BLOCK_N2
+        dq = _attn_bwd_dq(
+            dq, q, K, V, do, m, D,
+            stride_tok, stride_d, H, N_CTX_K,
+            BLOCK_M2, BLOCK_N2, HEAD_DIM, MATMUL_BF16,
+            start_m, 0, num_steps, MASK=False,
+        )
+
+        dq *= LN2
+        tl.store(DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d, dq)
+
+
+# ---------------------------------------------------------------------------
+# Backward autotuner cache persistence
+#
+# Set TRITON_AUTOTUNE_CACHE_DIR to a persistent directory (e.g. on Lustre)
+# to save and reload the best backward configs across torchrun invocations.
+# On the first run the autotuner times all configs and saves the winner;
+# on subsequent runs the winner is loaded at import time and the autotuner
+# skips all timing runs entirely.
+#
+# Writes are atomic (temp file + os.replace) and rank-0-only to avoid
+# concurrent write races in multi-GPU launches.
+# ---------------------------------------------------------------------------
+
+_BWD_CACHE_DIR = os.environ.get("TRITON_AUTOTUNE_CACHE_DIR")
+_BWD_CACHE_FILE = (
+    os.path.join(_BWD_CACHE_DIR, "attn_bwd_autotune.json")
+    if _BWD_CACHE_DIR else None
+)
+_bwd_saved_keys: set = set()
+_bwd_cache_loaded: bool = False
+
+
+def _save_bwd_autotune_cache() -> None:
+    if _BWD_CACHE_FILE is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    new_keys = set(_attn_bwd.cache.keys()) - _bwd_saved_keys
+    if not new_keys:
+        return
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+
+    # configs_timings is set on the Autotuner by run() after each fresh sweep:
+    #   self.configs_timings = {config: (median_ms, p20_ms, p80_ms), ...}
+    # Only present after a real autotune (not on cache-loaded runs).
+    timings = getattr(_attn_bwd, "configs_timings", {})
+
+    # Save winner cache (used for fast reload on subsequent runs).
+    cache_data = {}
+    for key, cfg in _attn_bwd.cache.items():
+        t = timings.get(cfg)
+        cache_data[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "time_ms": t[0] if t is not None else None,
+        }
+    tmp = _BWD_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache_data, f, indent=2)
+    os.replace(tmp, _BWD_CACHE_FILE)
+
+    # Save full ranking for each new key so we can verify the winner is
+    # meaningfully faster than the runner-up (guards against noisy timing).
+    ranking_file = _BWD_CACHE_FILE.replace(".json", "_ranking.json")
+    try:
+        existing = {}
+        if os.path.exists(ranking_file):
+            with open(ranking_file) as f:
+                existing = json.load(f)
+        sorted_cfgs = sorted(
+            timings.keys(),
+            key=lambda c: timings[c][0] if timings.get(c) is not None else float("inf"),
+        ) if timings else _attn_bwd.configs
+        for key in new_keys:
+            existing[json.dumps(list(key))] = [
+                {
+                    "rank": i + 1,
+                    "time_ms_median": timings[c][0] if timings.get(c) is not None else None,
+                    "time_ms_p20":    timings[c][1] if timings.get(c) is not None else None,
+                    "time_ms_p80":    timings[c][2] if timings.get(c) is not None else None,
+                    "kwargs": c.kwargs,
+                    "num_warps": c.num_warps,
+                    "num_stages": c.num_stages,
+                }
+                for i, c in enumerate(sorted_cfgs)
+            ]
+        tmp = ranking_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, ranking_file)
+    except Exception:
+        pass  # ranking is informational only — never break the main cache save
+
+    _bwd_saved_keys.update(new_keys)
+
+
+def _load_bwd_autotune_cache() -> None:
+    """Load saved autotune configs into _attn_bwd.cache.
+
+    Called lazily on the first backward pass so that torch.distributed is
+    already initialized. Rank 0 reads the file; the result is broadcast to
+    all other ranks so only one process hits Lustre.
+    """
+    global _bwd_cache_loaded
+    if _bwd_cache_loaded:
+        return
+    _bwd_cache_loaded = True
+
+    if _BWD_CACHE_FILE is None:
+        return
+
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 and os.path.exists(_BWD_CACHE_FILE):
+            with open(_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        if os.path.exists(_BWD_CACHE_FILE):
+            with open(_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_bwd.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+        )
+    # Mark loaded keys as already-saved so _save_bwd_autotune_cache does not
+    # overwrite them with time_ms=null on cache-hit runs (no fresh timing).
+    _bwd_saved_keys.update(_attn_bwd.cache.keys())
+
+
+# ---------------------------------------------------------------------------
+# Single-pass backward autotuner cache persistence
+# Uses a separate file (attn_bwd_sp_autotune.json) in the same cache dir so
+# two-phase and single-pass caches never collide even if TRITON_AUTOTUNE_CACHE_DIR
+# is accidentally shared between the two kernel variants.
+# ---------------------------------------------------------------------------
+
+_SP_BWD_CACHE_FILE = (
+    os.path.join(_BWD_CACHE_DIR, "attn_bwd_sp_autotune.json")
+    if _BWD_CACHE_DIR else None
+)
+_sp_bwd_saved_keys: set = set()
+_sp_bwd_cache_loaded: bool = False
+
+
+def _save_sp_bwd_autotune_cache() -> None:
+    if _SP_BWD_CACHE_FILE is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    new_keys = set(_attn_bwd_single_pass.cache.keys()) - _sp_bwd_saved_keys
+    if not new_keys:
+        return
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+
+    timings = getattr(_attn_bwd_single_pass, "configs_timings", {})
+
+    cache_data = {}
+    for key, cfg in _attn_bwd_single_pass.cache.items():
+        t = timings.get(cfg)
+        cache_data[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "time_ms": t[0] if t is not None else None,
+        }
+    tmp = _SP_BWD_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache_data, f, indent=2)
+    os.replace(tmp, _SP_BWD_CACHE_FILE)
+
+    ranking_file = _SP_BWD_CACHE_FILE.replace(".json", "_ranking.json")
+    try:
+        existing = {}
+        if os.path.exists(ranking_file):
+            with open(ranking_file) as f:
+                existing = json.load(f)
+        sorted_cfgs = sorted(
+            timings.keys(),
+            key=lambda c: timings[c][0] if timings.get(c) is not None else float("inf"),
+        ) if timings else _attn_bwd_single_pass.configs
+        for key in new_keys:
+            existing[json.dumps(list(key))] = [
+                {
+                    "rank": i + 1,
+                    "time_ms_median": timings[c][0] if timings.get(c) is not None else None,
+                    "time_ms_p20":    timings[c][1] if timings.get(c) is not None else None,
+                    "time_ms_p80":    timings[c][2] if timings.get(c) is not None else None,
+                    "kwargs": c.kwargs,
+                    "num_warps": c.num_warps,
+                    "num_stages": c.num_stages,
+                }
+                for i, c in enumerate(sorted_cfgs)
+            ]
+        tmp = ranking_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, ranking_file)
+    except Exception:
+        pass
+
+    _sp_bwd_saved_keys.update(new_keys)
+
+
+def _load_sp_bwd_autotune_cache() -> None:
+    global _sp_bwd_cache_loaded
+    if _sp_bwd_cache_loaded:
+        return
+    _sp_bwd_cache_loaded = True
+
+    if _SP_BWD_CACHE_FILE is None:
+        return
+
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 and os.path.exists(_SP_BWD_CACHE_FILE):
+            with open(_SP_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        if os.path.exists(_SP_BWD_CACHE_FILE):
+            with open(_SP_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_bwd_single_pass.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+        )
+    _sp_bwd_saved_keys.update(_attn_bwd_single_pass.cache.keys())
+
+
+# ---------------------------------------------------------------------------
+# Two-phase asymmetric backward autotuner cache persistence
+# Uses attn_bwd_ta_autotune.json — separate from two-phase and single-pass caches.
+# ---------------------------------------------------------------------------
+
+_TA_BWD_CACHE_FILE = (
+    os.path.join(_BWD_CACHE_DIR, "attn_bwd_ta_autotune.json")
+    if _BWD_CACHE_DIR else None
+)
+_ta_bwd_saved_keys: set = set()
+_ta_bwd_cache_loaded: bool = False
+
+
+def _save_ta_bwd_autotune_cache() -> None:
+    if _TA_BWD_CACHE_FILE is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    new_keys = set(_attn_bwd_two_phase_asym.cache.keys()) - _ta_bwd_saved_keys
+    if not new_keys:
+        return
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+    timings = getattr(_attn_bwd_two_phase_asym, "configs_timings", {})
+    cache_data = {}
+    for key, cfg in _attn_bwd_two_phase_asym.cache.items():
+        t = timings.get(cfg)
+        cache_data[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "time_ms": t[0] if t is not None else None,
+        }
+    tmp = _TA_BWD_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache_data, f, indent=2)
+    os.replace(tmp, _TA_BWD_CACHE_FILE)
+    _ta_bwd_saved_keys.update(new_keys)
+
+
+def _load_ta_bwd_autotune_cache() -> None:
+    global _ta_bwd_cache_loaded
+    if _ta_bwd_cache_loaded:
+        return
+    _ta_bwd_cache_loaded = True
+    if _TA_BWD_CACHE_FILE is None:
+        return
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 and os.path.exists(_TA_BWD_CACHE_FILE):
+            with open(_TA_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        if os.path.exists(_TA_BWD_CACHE_FILE):
+            with open(_TA_BWD_CACHE_FILE) as f:
+                cache_data[0] = json.load(f)
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_bwd_two_phase_asym.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+        )
+    _ta_bwd_saved_keys.update(_attn_bwd_two_phase_asym.cache.keys())
+
+
+# ---------------------------------------------------------------------------
+# Forward autotuner cache persistence
+# Each rank saves to its own file: attn_fwd_autotune_rank{r}.json.
+# This is necessary because different ranks see different (N_CTX_Q, N_CTX_K)
+# shapes (e.g. in ringX3, rank 0 never makes (2048,1024) forward calls so a
+# rank-0-only save would permanently miss that shape).
+# On load, rank 0 merges all per-rank files + the legacy single file, then
+# broadcasts the merged result. No cross-rank synchronization needed during save.
+# Reloaded configs carry pre_hook=_host_descriptor_pre_hook (no-op on XPU;
+# required on Hopper to configure TensorDescriptor block shapes before launch).
+# ---------------------------------------------------------------------------
+
+_fwd_saved_keys: set = set()
+_fwd_cache_loaded: bool = False
+
+
+def _fwd_cache_file(rank: int) -> Optional[str]:
+    if _BWD_CACHE_DIR is None:
+        return None
+    return os.path.join(_BWD_CACHE_DIR, f"attn_fwd_autotune_rank{rank}.json")
+
+
+def _merge_fwd_cache_files() -> dict:
+    """Return merged dict from all per-rank fwd cache files + legacy single file.
+
+    When the same key appears in multiple files, keep the entry with lower time_ms
+    (run-to-run variance can flip the winner between ranks; take the faster one).
+    """
+    import glob
+
+    def _merge_one(merged: dict, data: dict) -> None:
+        for key, val in data.items():
+            if key not in merged or val.get("time_ms", float("inf")) < merged[key].get("time_ms", float("inf")):
+                merged[key] = val
+
+    merged: dict = {}
+    # Legacy single file (produced before per-rank fix) — read for backward compat.
+    legacy = os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune.json")
+    if os.path.exists(legacy):
+        try:
+            with open(legacy) as f:
+                _merge_one(merged, json.load(f))
+        except Exception:
+            pass
+    for path in sorted(glob.glob(
+            os.path.join(_BWD_CACHE_DIR, "attn_fwd_autotune_rank*.json"))):
+        try:
+            with open(path) as f:
+                _merge_one(merged, json.load(f))
+        except Exception:
+            pass
+    return merged
+
+
+def _save_fwd_autotune_cache() -> None:
+    if _BWD_CACHE_DIR is None:
+        return
+    new_keys = set(_attn_fwd.cache.keys()) - _fwd_saved_keys
+    if not new_keys:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    # Only ranks 0 and 1 save: together they cover all 3 unique ringX3 forward
+    # shapes at any world_size (rank 1 sees all three; rank 0 covers world_size=1).
+    if rank > 1:
+        _fwd_saved_keys.update(new_keys)
+        return
+    cache_file = _fwd_cache_file(rank)
+    os.makedirs(_BWD_CACHE_DIR, exist_ok=True)
+    timings = getattr(_attn_fwd, "configs_timings", {})
+    # Read this rank's own existing file to preserve previously saved entries.
+    existing: dict = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file) as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+    for key in new_keys:
+        cfg = _attn_fwd.cache[key]
+        t = timings.get(cfg)
+        existing[json.dumps(list(key))] = {
+            "kwargs": cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "time_ms": t[0] if t is not None else None,
+        }
+    tmp = cache_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(existing, f, indent=2)
+    os.replace(tmp, cache_file)
+    _fwd_saved_keys.update(new_keys)
+
+
+def _load_fwd_autotune_cache() -> None:
+    """Load forward autotune configs (all ranks' files merged) into _attn_fwd.cache.
+
+    Called lazily on the first forward pass so torch.distributed is already
+    initialized. Rank 0 merges all per-rank files; result is broadcast so only
+    one process hits Lustre.
+    """
+    global _fwd_cache_loaded
+    if _fwd_cache_loaded:
+        return
+    _fwd_cache_loaded = True
+    if _BWD_CACHE_DIR is None:
+        return
+    cache_data = [None]
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            merged = _merge_fwd_cache_files()
+            if merged:
+                cache_data[0] = merged
+        torch.distributed.broadcast_object_list(cache_data, src=0)
+    else:
+        merged = _merge_fwd_cache_files()
+        if merged:
+            cache_data[0] = merged
+    if cache_data[0] is None:
+        return
+    for str_key, cfg_dict in cache_data[0].items():
+        key = tuple(json.loads(str_key))
+        _attn_fwd.cache[key] = triton.Config(
+            cfg_dict["kwargs"],
+            num_stages=cfg_dict["num_stages"],
+            num_warps=cfg_dict["num_warps"],
+            pre_hook=_host_descriptor_pre_hook,
+        )
+    # Mark loaded keys as already-saved so _save_fwd_autotune_cache does not
+    # re-save them with time_ms=null on cache-hit runs (no fresh timing).
+    _fwd_saved_keys.update(_attn_fwd.cache.keys())
+
+
+# ---------------------------------------------------------------------------
 # Python autograd wrapper
 # KEY CHANGE: forward() now returns (o, M) so LSE is available to callers
 # (e.g. ring attention algorithms that need it for the reduce step)
 # ---------------------------------------------------------------------------
+
+# Selects which backward kernel to use.  Default is the existing two-phase
+# kernel so all existing runs are unaffected until explicitly opted in.
+_BWD_KERNEL = os.environ.get("RINGX_ATTN_BWD_KERNEL", "two_phase")
+
 
 class _attention(torch.autograd.Function):
 
@@ -697,21 +1391,25 @@ class _attention(torch.autograd.Function):
             waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
-        # M holds the LSE values — shape (batch, heads, seqlen)
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        N_CTX_Q = q.shape[2]
+        N_CTX_K = k.shape[2]
+        # M holds the LSE values — shape (batch, heads, seqlen_q)
+        M = torch.empty((q.shape[0], q.shape[1], N_CTX_Q), device=q.device, dtype=torch.float32)
 
         if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            # Q and O use N_CTX_Q rows; K and V use N_CTX_K rows (may differ for asymmetric calls)
+            y_dim_q = q.shape[0] * q.shape[1] * N_CTX_Q
+            y_dim_k = q.shape[0] * q.shape[1] * N_CTX_K
             dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_q = TensorDescriptor(q, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
+                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim_k], strides=[N_CTX_K, 1],
                                           block_shape=dummy_block)
             else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                desc_v = TensorDescriptor(v, shape=[y_dim_k, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
                                           block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[y_dim_k, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_o = TensorDescriptor(o, shape=[y_dim_q, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
         else:
             desc_q = q
             desc_v = v
@@ -724,7 +1422,7 @@ class _attention(torch.autograd.Function):
         triton.set_allocator(alloc_fn)
 
         def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+            return (triton.cdiv(N_CTX_Q, META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
         if is_blackwell() and warp_specialize:
@@ -732,11 +1430,12 @@ class _attention(torch.autograd.Function):
                 extra_kern_args["maxnreg"] = 168
             else:
                 extra_kern_args["maxnreg"] = 80
+        _load_fwd_autotune_cache()
         _attn_fwd[grid](
             sm_scale, M,
             q.shape[0], q.shape[1],
             desc_q, desc_k, desc_v, desc_o,
-            N_CTX=q.shape[2],
+            N_CTX_Q=N_CTX_Q, N_CTX_K=N_CTX_K,
             HEAD_DIM=HEAD_DIM_K,
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,
             USE_BF16=q.dtype == torch.bfloat16,
@@ -744,6 +1443,7 @@ class _attention(torch.autograd.Function):
             warp_specialize=warp_specialize,
             IS_HOPPER=is_hopper(),
             **extra_kern_args)
+        _save_fwd_autotune_cache()
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
@@ -762,42 +1462,83 @@ class _attention(torch.autograd.Function):
         v = v.contiguous()
         o = o.contiguous()
         assert do.is_contiguous()
-        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-        dq = torch.empty_like(q)
+        # q/do/o must share strides (same seqlen); k/v must share strides with each other
+        # but may differ from q when seqlens differ (asymmetric cross-attention)
+        assert q.stride() == o.stride() == do.stride()
+        assert k.stride() == v.stride()
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        BATCH, N_HEAD, N_CTX_Q = q.shape[:3]
+        N_CTX_K = k.shape[2]
         PRE_BLOCK = 128
-        NUM_WARPS, NUM_STAGES = 4, 5
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-        BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634
         arg_k = k
         arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-        assert N_CTX % PRE_BLOCK == 0
-        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        assert N_CTX_Q % PRE_BLOCK == 0
+        pre_grid = (N_CTX_Q // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
+
         _attn_bwd_preprocess[pre_grid](
             o, do,
             delta,
-            BATCH, N_HEAD, N_CTX,
+            BATCH, N_HEAD, N_CTX_Q,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM
         )
-        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
-        _attn_bwd[grid](
-            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
-            M, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            N_HEAD, N_CTX,
-            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,
-            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            HEAD_DIM=ctx.HEAD_DIM,
-            MATMUL_BF16=q.dtype == torch.bfloat16,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            CAUSAL=ctx.causal,
-        )
+
+        is_xpu = ACTIVE_TORCH_DEVICE_TYPE == "xpu"
+        is_asymmetric = N_CTX_Q != N_CTX_K
+
+        if is_asymmetric and is_xpu:
+            # XPU asymmetric: two_phase_asym avoids evict_last and handles Q/KV seqlen mismatch.
+            dq = torch.empty_like(q)
+            _load_ta_bwd_autotune_cache()
+            bwd_ta_grid = lambda META: (
+                max(triton.cdiv(N_CTX_K, META['BLOCK_N1']), triton.cdiv(N_CTX_Q, META['BLOCK_M2'])),
+                1, BATCH * N_HEAD,
+            )
+            _attn_bwd_two_phase_asym[bwd_ta_grid](
+                q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
+                M, delta,
+                q.stride(0), q.stride(1), k.stride(0), k.stride(1), q.stride(2), q.stride(3),
+                N_HEAD, N_CTX_Q, N_CTX_K,
+                HEAD_DIM=ctx.HEAD_DIM,
+                MATMUL_BF16=q.dtype == torch.bfloat16,
+            )
+            _save_ta_bwd_autotune_cache()
+        elif is_asymmetric or _BWD_KERNEL == "single_pass":
+            # CUDA asymmetric → single_pass (evict_last works on A100).
+            # Symmetric with explicit RINGX_ATTN_BWD_KERNEL=single_pass also lands here.
+            dq = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
+            _load_sp_bwd_autotune_cache()
+            _attn_bwd_single_pass[(BATCH * N_HEAD,)](
+                q, arg_k, v, ctx.sm_scale,
+                do, dq, dk, dv,
+                M, delta,
+                q.stride(0), q.stride(1), k.stride(0), k.stride(1), q.stride(2), q.stride(3),
+                N_HEAD, N_CTX_Q, N_CTX_K,
+                HEAD_DIM=ctx.HEAD_DIM,
+                MATMUL_BF16=q.dtype == torch.bfloat16,
+                CAUSAL=ctx.causal,
+            )
+            _save_sp_bwd_autotune_cache()
+            dq = dq.mul(0.6931471824645996).to(q.dtype)
+        else:
+            # Symmetric two-phase (default on both XPU and CUDA unless overridden).
+            dq = torch.empty_like(q)
+            _load_bwd_autotune_cache()
+            bwd_grid = lambda META: (triton.cdiv(N_CTX_Q, META['BLOCK_N1']), 1, BATCH * N_HEAD)
+            _attn_bwd[bwd_grid](
+                q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
+                M, delta,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                N_HEAD, N_CTX_Q,
+                BLK_SLICE_FACTOR=2,
+                HEAD_DIM=ctx.HEAD_DIM,
+                MATMUL_BF16=q.dtype == torch.bfloat16,
+                CAUSAL=ctx.causal,
+            )
+            _save_bwd_autotune_cache()
+
         return dq, dk, dv, None, None, None
 
 
